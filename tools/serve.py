@@ -610,12 +610,36 @@ def probe_mid(mid):
     来源列表直接复用 discover_series()，不另写一套发现逻辑 ——
     「哪个系列算回放」的判断只有一份，才不会出现两处挑出不同结果。
     """
-    mid = str(mid or "").strip()
-    if not mid.isdigit():
-        raise RuntimeError("UID 必须是纯数字（B 站空间号：个人主页网址"
-                           " space.bilibili.com/<数字> 里那串数字）")
+    raw = str(mid or "").strip()
+    via_room = ""
+    m = re.search(r"live\.bilibili\.com/(\d+)", raw)
+    if m:
+        # 直接粘了直播间链接：先按房间号换成真实 UID，避免把房间号当 UID
+        meta = _live_room_info(m.group(1))
+        if not meta["uid"]:
+            raise RuntimeError("这个直播间没有绑定主播 UID")
+        mid, via_room = meta["uid"], meta["room_id"]
+    else:
+        if not raw.isdigit():
+            raise RuntimeError("UID 必须是纯数字（B 站空间号：个人主页网址"
+                               " space.bilibili.com/<数字> 里那串数字）")
+        mid = raw
+        # 常见误填：把**直播间号**当成 UID。若这个数字确实是一个直播间、
+        # 其主播 UID 不是它，且该 UID 自己没在播 —— 这就是明显的误填。
+        # 这时改用房间的真实 UID，并在结果里标 via_room，界面会明确告知。
+        try:
+            meta = _live_room_info(raw)
+            if meta["uid"] and meta["uid"] != raw:
+                d0 = bili_get("https://api.live.bilibili.com/room/v1/Room/"
+                              "get_status_info_by_uids?uids[]=%s" % urllib.parse.quote(raw),
+                              "https://live.bilibili.com/")
+                own = ((d0.get("data") or {}).get(raw)) or {}
+                if meta["living"] and int(own.get("live_status") or 0) != 1:
+                    mid, via_room = meta["uid"], raw
+        except Exception:
+            pass
     live = bili_get("https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids"
-                    "?uids[]=%s" % mid, "https://live.bilibili.com/")
+                    "?uids[]=%s" % urllib.parse.quote(mid), "https://live.bilibili.com/")
     if live.get("code") != 0:
         raise RuntimeError("查主播接口 code=%s %s" % (live.get("code"), live.get("message")))
     info = ((live.get("data") or {}).get(mid)) or {}
@@ -635,7 +659,8 @@ def probe_mid(mid):
             err = "这位的「合集和系列」里还没有内容"
     except Exception as e:
         err = str(e)
-    return {"mid": mid, "name": str(info.get("uname") or "").strip(),
+    return {"mid": mid, "via_room": via_room,
+            "name": str(info.get("uname") or "").strip(),
             "room": str(info.get("room_id") or ""),
             # 头像：页面拿它自动挑一个板块色（图片经 /api/img 代理，同源，canvas 能读像素）
             "face": str(info.get("face") or "").strip(),
@@ -1062,8 +1087,11 @@ def read_build_stamp():
 # 其余一律回空应答（前端此时正停在引导页上，本来也不会去取节目单）。
 STATIONLESS_OK = (
     "/api/stations", "/api/stations/probe", "/api/stations/save", "/api/stations/delete",
+    "/api/stations/following", "/api/stations/bulk",
     "/api/stations/main",
     "/api/ping", "/api/status", "/api/img", "/api/quit",
+    "/api/clip/cover", "/api/clip/cover/preview",
+    "/api/clip/cover/choose",  # 本地封面预览/确认，与主播无关
     "/api/page/alive", "/api/page/bye",
     "/api/protocol/register", "/api/protocol/unregister",
     "/api/following/live",     # 只依赖登录态，与有没有注册主播无关
@@ -1074,6 +1102,11 @@ STATIONLESS_OK = (
     "/api/playlist/tag",
     "/api/playlist/create", "/api/playlist/move",
     "/api/playlist/like", "/api/lyrics", "/api/stations/weibo", "/api/dd/actions", "/api/dd/wordcloud", "/api/dd/lives", "/api/dd/fans", "/api/dd/profile",
+    # 录播姬：录的是任意直播间，与「有没有注册主播」无关
+    "/api/recorder/state", "/api/recorder/files", "/api/recorder/add",
+    "/api/recorder/remove", "/api/recorder/start", "/api/recorder/stop",
+    "/api/recorder/settings", "/api/recorder/pick", "/api/recorder/open",
+    "/api/recorder/name_test", "/api/recorder/reveal",
 )
 
 
@@ -1381,6 +1414,146 @@ def _clip_unique(path):
     return path
 
 
+# ---- 封面：保存时只记候选时间点，用户确认后才落盘 ---------------------------
+# 保存切片时**不写任何封面文件**：只在 <切片名>.covers.json 里记 5 个候选时间点。
+# 页面按需调用 preview 抽缩略图；用户点「确认使用这一版」后，才把选中的那一帧
+# 按 1920x1080（16:9）与 1080x1440（3:4）落成两张 PNG：
+#   <切片名>_cover_16x9.png / <切片名>_cover_3x4.png
+# 其余候选只存在于视频里（随时可重新抽），不占磁盘，也不会被误认为「已用封面」。
+CLIP_COVER_N = 5
+CLIP_COVER_16X9 = (1920, 1080)
+CLIP_COVER_3X4 = (1080, 1440)
+CLIP_COVER_PREVIEW = {"16x9": (480, 270), "3x4": (270, 360)}
+CLIP_COVER_RE = re.compile(
+    r"(_cover_(?:16x9|3x4)(?:_\d{2})?|_default_(?:16x9|3x4))\.png$", re.I)
+COVER_PREVIEW_CACHE = {}
+COVER_PREVIEW_CACHE_MAX = 160
+
+
+def _clip_base_name(raw, fallback):
+    """用户自定义的切片名：去掉扩展名与非法字符；空则回退自动名。"""
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(raw or "")).strip(" ._")
+    s = re.sub(r"\.(mp4|flv|mkv|mov)$", "", s, flags=re.I)[:80].strip(" ._")
+    return s or fallback
+
+
+def _clip_meta_path(mp4):
+    return os.path.splitext(mp4)[0] + ".covers.json"
+
+
+def _clip_cover_times(dur):
+    """候选时间点：避开头尾 5%，均匀铺满。"""
+    dur = float(dur or 0)
+    lo = max(0.2, dur * 0.05)
+    hi = max(lo, dur * 0.94)
+    step = (hi - lo) / max(1, CLIP_COVER_N - 1)
+    return [round(lo + step * i, 2) for i in range(CLIP_COVER_N)]
+
+
+def _clip_cover_filter(size):
+    """increase + crop：先铺满再居中裁切，严格比例、不拉变形。"""
+    lw, lh = size["16x9"]
+    pw, ph = size["3x4"]
+    return ("[0:v]split=2[a][b];"
+            "[a]scale=%d:%d:force_original_aspect_ratio=increase,"
+            "crop=%d:%d,setsar=1[l];"
+            "[b]scale=%d:%d:force_original_aspect_ratio=increase,"
+            "crop=%d:%d,setsar=1[p]"
+            % (lw, lh, lw, lh, pw, ph, pw, ph))
+
+
+def _clip_cover_meta(out, dur):
+    """保存时写侧车：只记候选时间点，chosen 为空，等用户确认。"""
+    times = _clip_cover_times(dur)
+    meta = {"video": os.path.basename(out),
+            "base": os.path.basename(os.path.splitext(out)[0]),
+            "count": len(times),
+            "candidates": [{"index": i + 1, "at": t} for i, t in enumerate(times)],
+            "chosen": None,
+            "createdAt": int(time.time())}
+    _write_json_file(_clip_meta_path(out), meta)
+    return meta
+
+
+def _clip_cover_candidate(mp4, index):
+    meta = _read_json_file(_clip_meta_path(mp4))
+    if not isinstance(meta, dict):
+        raise RuntimeError("这一段的封面信息不见了（.covers.json 缺失）")
+    for c in (meta.get("candidates") or []):
+        if int(c.get("index") or 0) == int(index):
+            return meta, c
+    raise RuntimeError("没有第 %s 版候选" % index)
+
+
+def _clip_cover_preview(mp4, index, orient):
+    """按需抽一张小图给页面预览（不落盘，内存缓存）。"""
+    orient = "3x4" if str(orient) == "3x4" else "16x9"
+    meta, cand = _clip_cover_candidate(mp4, index)
+    key = (os.path.abspath(mp4), int(index), orient, os.path.getmtime(mp4))
+    hit = COVER_PREVIEW_CACHE.get(key)
+    if hit:
+        return hit
+    ff = seg_ffmpeg()
+    if not ff:
+        raise RuntimeError("本机没找到 ffmpeg")
+    try:
+        from auto_segments import NO_WINDOW, HIDE_SI
+    except Exception:
+        NO_WINDOW, HIDE_SI = 0, None
+    w, h = CLIP_COVER_PREVIEW[orient]
+    vf = ("scale=%d:%d:force_original_aspect_ratio=increase,"
+          "crop=%d:%d,setsar=1" % (w, h, w, h))
+    cmd = [ff, "-hide_banner", "-loglevel", "error",
+           "-ss", "%.3f" % float(cand.get("at") or 0), "-i", mp4,
+           "-frames:v", "1", "-vf", vf, "-f", "image2pipe", "-vcodec", "png", "-"]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       timeout=60, creationflags=NO_WINDOW, startupinfo=HIDE_SI)
+    if r.returncode != 0 or not r.stdout.startswith(b"\x89PNG"):
+        raise RuntimeError("抽帧失败：%s" % (r.stderr or b"")[:120])
+    if len(COVER_PREVIEW_CACHE) >= COVER_PREVIEW_CACHE_MAX:
+        COVER_PREVIEW_CACHE.clear()
+    COVER_PREVIEW_CACHE[key] = r.stdout
+    return r.stdout
+
+
+def _clip_cover_choose(mp4, index):
+    """用户确认的封面：把该版按两种比例落盘，并写进侧车。只动这一段的文件。"""
+    ff = seg_ffmpeg()
+    if not ff:
+        raise RuntimeError("本机没找到 ffmpeg")
+    meta, cand = _clip_cover_candidate(mp4, index)
+    try:
+        from auto_segments import NO_WINDOW, HIDE_SI
+    except Exception:
+        NO_WINDOW, HIDE_SI = 0, None
+    base = os.path.splitext(mp4)[0]
+    lp = base + "_cover_16x9.png"
+    pp = base + "_cover_3x4.png"
+    # 先写 .part.png 再改名，失败时不会在正式文件名下留坏图
+    lt = lp[:-4] + ".part.png"
+    pt = pp[:-4] + ".part.png"
+    cmd = [ff, "-hide_banner", "-loglevel", "error",
+           "-ss", "%.3f" % float(cand.get("at") or 0), "-i", mp4,
+           "-filter_complex", _clip_cover_filter({"16x9": CLIP_COVER_16X9,
+                                                  "3x4": CLIP_COVER_3X4}),
+           "-map", "[l]", "-frames:v", "1", "-update", "1", "-y", lt,
+           "-map", "[p]", "-frames:v", "1", "-update", "1", "-y", pt]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                       text=True, encoding="utf-8", errors="ignore",
+                       timeout=90, creationflags=NO_WINDOW, startupinfo=HIDE_SI)
+    if r.returncode != 0 or not os.path.exists(lt) or not os.path.exists(pt):
+        raise RuntimeError("生成封面失败：%s" % (r.stderr or "")[:160])
+    os.replace(lt, lp)
+    os.replace(pt, pp)
+    meta["chosen"] = {"index": int(index), "at": cand.get("at"),
+                      "landscape": os.path.basename(lp),
+                      "portrait": os.path.basename(pp),
+                      "confirmedAt": int(time.time())}
+    _write_json_file(_clip_meta_path(mp4), meta)
+    return {"chosen": meta["chosen"], "landscape": lp, "portrait": pp}
+
+
+
 CLIP_W, CLIP_H = 1920, 1080          # 保存成品统一 1080p
 # scale 后再 pad：源不是 16:9 时补黑边而不是拉变形；setsar=1 免得某些播放器按
 # 非方形像素放大。源本来 1080p 时这一步等于恒等变换。
@@ -1465,8 +1638,12 @@ def _clip_worker(items, outdir):
     for i, it in enumerate(items):
         if CLIP_JOB.get("cancel"):
             break
-        name = _clip_name(it.get("title"), it.get("n"), it["start"], it["end"])
-        out = _clip_unique(os.path.join(outdir, name))
+        auto = os.path.splitext(_clip_name(it.get("title"), it.get("n"),
+                                           it["start"], it["end"]))[0]
+        # 用户给了名字就用它（视频与封面共用同一个 basename）；重名由 _clip_unique 加序号
+        base = _clip_base_name(it.get("name"), auto)
+        out = _clip_unique(os.path.join(outdir, base + ".mp4"))
+        name = os.path.basename(out)
         with CLIP_LOCK:
             CLIP_JOB.update(idx=i + 1, current=name)
         try:
@@ -1510,13 +1687,22 @@ def _clip_worker(items, outdir):
             proc.wait(timeout=1800)
             if proc.returncode != 0:
                 raise RuntimeError("".join(errbuf) or ("ffmpeg 退出码 %s" % proc.returncode))
+            # 封面：只记候选时间点，等用户在页面里挑一版再落盘
+            covers = {}
+            try:
+                with CLIP_LOCK:
+                    CLIP_JOB["current"] = "%s（记录封面候选…）" % name
+                covers = _clip_cover_meta(out, dur)
+            except Exception as ce:
+                covers = {"error": str(ce)[:200]}
             with CLIP_LOCK:
                 CLIP_JOB["done"].append({"name": name, "path": out, "ok": True,
                                          "quality": media.get("id"),
                                          "src": media["kind"],
                                          "srcHeight": media.get("height") or 0,
                                          "res": "%dx%d" % (CLIP_W, CLIP_H),
-                                         "seconds": round(dur, 1)})
+                                         "seconds": round(dur, 1),
+                                         "covers": covers})
         except Exception as e:
             with CLIP_LOCK:
                 CLIP_JOB["done"].append({"name": name, "path": "", "ok": False,
@@ -1553,7 +1739,8 @@ def api_clip_start(obj):
         if not bvid or not cid or not (b > a):
             continue
         clean.append({"bvid": bvid, "cid": cid, "start": a, "end": b,
-                      "title": str(it.get("title") or ""), "n": it.get("n") or 1})
+                      "title": str(it.get("title") or ""), "n": it.get("n") or 1,
+                      "name": str(it.get("name") or "").strip()[:80]})
     if not clean:
         return 400, {"error": "分段数据不完整"}
     with CLIP_LOCK:
@@ -1573,6 +1760,79 @@ def api_clip_status():
     d["defaultDir"] = _clip_default_dir()
     d["ffmpeg"] = seg_ffmpeg() != ""
     return 200, d
+
+
+def _clip_allowed_path(raw, exts):
+    """只放行「本批输出目录 / 默认目录」下、扩展名匹配的本机文件。
+
+    这是本机服务，但也不该变成任意路径读取器。
+    """
+    p = os.path.abspath(str(raw or "").strip())
+    if not p or not os.path.isfile(p):
+        return ""
+    if os.path.splitext(p)[1].lower() not in exts:
+        return ""
+    allowed = [_clip_default_dir()]
+    with CLIP_LOCK:
+        allowed.append(CLIP_JOB.get("dir") or "")
+        for d in (CLIP_JOB.get("done") or []):
+            if d.get("path"):
+                allowed.append(os.path.dirname(d["path"]))
+    for d in allowed:
+        d = _clip_check_dir(d or "") or ""
+        if not d:
+            continue
+        try:
+            if os.path.commonpath([p, os.path.abspath(d)]) == os.path.abspath(d):
+                return p
+        except ValueError:
+            pass
+    return ""
+
+
+def api_clip_cover(raw):
+    """GET /api/clip/cover?path= —— 已确认的封面 PNG（或旧版候选图）。"""
+    p = _clip_allowed_path(raw, (".png",))
+    if not p:
+        return 404, None, None
+    if not CLIP_COVER_RE.search(os.path.basename(p)):
+        return 403, None, None
+    try:
+        with open(p, "rb") as f:
+            return 200, "image/png", f.read(12 * 1024 * 1024)
+    except OSError:
+        return 404, None, None
+
+
+def api_clip_cover_preview(raw, index, orient):
+    """GET /api/clip/cover/preview?path=<mp4>&index=N&orient=16x9|3x4
+
+    现场抽一张小图（不落盘），供用户挑封面用。
+    """
+    p = _clip_allowed_path(raw, (".mp4",))
+    if not p:
+        return 404, None, None
+    try:
+        return 200, "image/png", _clip_cover_preview(p, index, orient)
+    except Exception:
+        return 404, None, None
+
+
+def api_clip_cover_choose(obj):
+    """POST /api/clip/cover/choose {path, index} —— 用户确认的封面才落盘。"""
+    p = _clip_allowed_path(obj.get("path"), (".mp4",))
+    if not p:
+        return 400, {"error": "找不到这一段视频（或不在保存目录里）"}
+    try:
+        index = int(obj.get("index"))
+    except (TypeError, ValueError):
+        return 400, {"error": "缺少要使用的候选序号"}
+    try:
+        r = _clip_cover_choose(p, index)
+    except Exception as e:
+        return 400, {"error": str(e)[:160]}
+    return 200, {"ok": True, "chosen": r["chosen"],
+                 "landscape": r["landscape"], "portrait": r["portrait"]}
 
 
 def _pick_dir_win32(initial=""):
@@ -1772,6 +2032,1627 @@ def api_songcut_apply(obj):
     except Exception as e:
         return 400, {"error": str(e)}
     return 200, {"ok": True, "count": n, "file": name}
+
+
+# ---------------------------------------------------------------- 录播姬（v1.9.15）
+#
+# 参考 BililiveRecorder 的组织方式：房间卡片 + 录制开关 + 文件/日志。
+# 与 stations.json **无关** —— 它录的是「任意一个直播间」，不影响现有的主播/回放体系。
+#
+# 采集用 ffmpeg 直录 FLV、-c copy 不转码（CPU≈0）：
+#   · FLV 是流式的，断流 / 强杀都不毁整个文件（mp4 的 moov 在尾部，中断就废）；
+#   · 代价是浏览器 <video> 播不了 —— 所以这里只列文件 + 打开所在目录，不做内嵌播放。
+#
+# 调度是**一个线程扫所有房间**，不是每房间一个线程：房间数是个位数，串行查开播够用；
+# 「停止」由接口直接 terminate 进程，不等调度轮次，所以响应是即时的。
+
+REC_FILE = os.path.join(ROOT, "data", "recorder.json")
+RC_QN = 10000                  # 原画；B 站会按登录态自动降级
+RC_MAX_LIVE = 4                # 同时录制上限
+RC_MIN_FREE = 2 * 1024 ** 3    # 剩余磁盘低于 2GB 不再开新录制
+RC_POLL = 45.0                 # 未开播时的复查间隔（秒）
+RC_TICK = 4.0                  # 调度线程扫描间隔
+RC_MAX_ROOMS = 20
+RC_LOG_MAX = 400
+RC_DEFAULT_TEMPLATE = "{{ name }}/录制-{{ roomid }}-{{ time }}"
+RC_DEFAULT_SEG_MB = 1024        # 按大小分段：默认 1 GB
+RC_DEFAULT_SEG_MIN = 60         # 按时间分段：默认 60 分钟
+RC_QN_VALID = (10000, 400, 250, 150, 80)
+
+REC_LOCK = threading.Lock()
+RC_RT = {}       # room -> 运行态（内存，不落盘）
+RC_PROC = {}     # room -> Popen
+RC_DM = {}       # room -> {"stop": Event, "thread": Thread, "xml": path}
+RC_LOG = []      # [{t, room, name, msg, lv}]
+RC_LOOP = {"thread": None}
+RC_EXITING = [0.0]      # >0 = 页面已关闭、正在等录制收尾（此时不再开新录制）
+
+
+def _rc_default_dir():
+    return os.path.join(os.path.expanduser("~"), "Videos", "噼里啪啦", "录播")
+
+
+def _rc_settings(st):
+    """把落盘的设置补全成一套完整值。
+
+    老版本 recorder.json 只有 dir / qn / auto —— 其余键按默认补齐，
+    所以升级不会把老用户的配置读成空。
+    """
+    st = st if isinstance(st, dict) else {}
+
+    def flag(k, d):
+        v = st.get(k)
+        return d if v is None else bool(v)
+
+    def num(k, d, lo, hi):
+        try:
+            v = int(st.get(k, d))
+        except (TypeError, ValueError):
+            v = d
+        return max(lo, min(hi, v))
+
+    seg = str(st.get("segment") or "none")
+    if seg not in ("none", "size", "time"):
+        seg = "none"
+    mode = str(st.get("mode") or "standard")
+    if mode not in ("standard", "raw"):
+        mode = "standard"
+    qn_ids = re.sub(r"[^0-9,]", "", str(st.get("qnIds") or "")) or "10000,400,250,150"
+    parts = [x for x in qn_ids.split(",") if x.strip()]
+    qn_ids = ",".join(parts[:6])
+    try:
+        qn = int(st.get("qn") or RC_QN)
+    except (TypeError, ValueError):
+        qn = RC_QN
+    return {
+        "dir": st.get("dir") or _rc_default_dir(),
+        "qn": qn if qn in RC_QN_VALID else RC_QN,
+        "qnIds": qn_ids,
+        # 自动录制：启动即把房间置为监控，开播就录（默认开）
+        "auto": flag("auto", True),
+        # 后台应用图标（系统托盘）。关掉只是不显示图标，**不影响录制**
+        "tray": flag("tray", True),
+        "danmaku": flag("danmaku", True),          # 保存弹幕（XML 侧车文件）
+        "mode": mode,                              # standard / raw
+        "repairMissing": flag("repairMissing", True),
+        "repairGlitch": flag("repairGlitch", False),
+        "segment": seg,
+        "segmentSize": num("segmentSize", RC_DEFAULT_SEG_MB, 16, 10240),
+        "segmentMinutes": num("segmentMinutes", RC_DEFAULT_SEG_MIN, 1, 720),
+        "segmentTitle": flag("segmentTitle", True),
+        "cover": flag("cover", False),
+        "filename": str(st.get("filename") or "")[:200],
+        "filenameDefault": flag("filenameDefault", True),
+        "notify": flag("notify", True),
+        "skipTitle": str(st.get("skipTitle") or "")[:500],
+        "webhookV2": str(st.get("webhookV2") or "")[:300],
+        "webhookV1": str(st.get("webhookV1") or "")[:300],
+    }
+
+
+def _rc_doc():
+    d = _read_json_file(REC_FILE)
+    d = d if isinstance(d, dict) else {}
+    st = d.get("settings") if isinstance(d.get("settings"), dict) else {}
+    rooms = []
+    for r in (d.get("rooms") or []):
+        if not isinstance(r, dict):
+            continue
+        room = str(r.get("room") or "").strip()
+        if not room.isdigit():
+            continue
+        rooms.append({"room": room, "uid": str(r.get("uid") or ""),
+                      "name": str(r.get("name") or room),
+                      "face": str(r.get("face") or ""),
+                      "enabled": bool(r.get("enabled")),
+                      "dir": str(r.get("dir") or "")})
+    return {"version": 1, "settings": _rc_settings(st), "rooms": rooms}
+
+
+def _rc_save(doc):
+    _write_json_file(REC_FILE, doc)
+
+
+def _rc_log(msg, room="", name="", lv="info"):
+    with REC_LOCK:
+        RC_LOG.append({"t": time.strftime("%H:%M:%S"), "room": str(room or ""),
+                       "name": name or "", "msg": str(msg)[:300], "lv": lv})
+        del RC_LOG[:-RC_LOG_MAX]
+    print("[recorder] %s%s %s" % (name or "-", ("(%s)" % room) if room else "", msg))
+
+
+def _rc_rt(room):
+    """该房间的运行态（没有就建一个）。⚠️ 内部会拿 REC_LOCK，别在锁里再调它。"""
+    with REC_LOCK:
+        return RC_RT.setdefault(str(room), {
+            "state": "idle", "since": 0, "file": "", "bytes": 0, "error": "",
+            "pid": 0, "title": "", "living": False, "next": 0,
+            "liveTitle": "", "segNo": 0, "xml": "", "cover": "",
+            "area": "", "titleAt": 0, "skip": ""})
+
+
+def _rc_busy():
+    """是否还有录制在写盘。退出判定只看这一个 —— 托盘、页面、自动录制开关都不算。"""
+    with REC_LOCK:
+        procs = list(RC_PROC.values())
+    for p in procs:
+        try:
+            if p.poll() is None:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _rc_busy_n():
+    """正在录的路数（给托盘提示用）。"""
+    n = 0
+    with REC_LOCK:
+        procs = list(RC_PROC.values())
+    for p in procs:
+        try:
+            if p.poll() is None:
+                n += 1
+        except Exception:
+            pass
+    return n
+
+
+def _rc_disk(path):
+    """剩余空间。目录还不存在时用最近的已存在祖先 ——
+    否则一律返回 0，界面显示「剩余 0 GB」，看着像磁盘满了。"""
+    p = os.path.abspath(path or ".")
+    for _ in range(6):
+        try:
+            u = shutil.disk_usage(p)
+            return {"free": u.free, "total": u.total}
+        except OSError:
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+    return {"free": 0, "total": 0}
+
+
+def _rc_room_info(room):
+    """按房间号取 uid / 标题 / 开播状态。room/v1/Room/get_info 不需要签名。"""
+    d = bili_get("https://api.live.bilibili.com/room/v1/Room/get_info?room_id=%s" % room,
+                 "https://live.bilibili.com/%s" % room, fallback_anon=True)
+    if d.get("code") != 0:
+        raise RuntimeError(d.get("message") or ("code=%s" % d.get("code")))
+    x = d.get("data") or {}
+    if not str(x.get("room_id") or "").isdigit():
+        raise RuntimeError("房间不存在")
+    area = x.get("area_name") or ""
+    parent = x.get("parent_area_name") or ""
+    return {"uid": str(x.get("uid") or ""), "title": x.get("title") or "",
+            "living": int(x.get("live_status") or 0) == 1,
+            "area": (parent + " · " + area) if (parent and area) else (area or parent),
+            "cover": x.get("keyframe") or x.get("user_cover") or ""}
+
+
+def _rc_master(uid):
+    """uid → 主播名 / 头像。走直播域（比主站 acc/info 少一点风控）。"""
+    if not str(uid or "").isdigit():
+        return "", ""
+    try:
+        d = bili_get("https://api.live.bilibili.com/live_user/v1/Master/info?uid=%s" % uid,
+                     "https://live.bilibili.com/", fallback_anon=True)
+        if d.get("code") != 0:
+            return "", ""
+        info = (d.get("data") or {}).get("info") or {}
+        return info.get("uname") or "", info.get("face") or ""
+    except Exception:
+        return "", ""
+
+
+def _rc_uid_room(uid):
+    """按 UID 反查房间号（用户常直接粘主播 ID）。这个接口只收 POST JSON。"""
+    h = {"User-Agent": UA, "Referer": "https://live.bilibili.com/",
+         "Content-Type": "application/json"}
+    s = sessdata()
+    if s:
+        h["Cookie"] = "SESSDATA=" + s
+    try:
+        req = urllib.request.Request(
+            "https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids",
+            data=json.dumps({"uids": [int(uid)]}).encode("utf-8"), headers=h)
+        with DIRECT_OPENER.open(req, timeout=20) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        if d.get("code") == 0:
+            x = (d.get("data") or {}).get(str(uid)) or {}
+            return str(x.get("room_id") or "")
+    except Exception:
+        pass
+    return ""
+
+
+def _rc_parse(text):
+    """房间号 / 直播间链接 / 主播 UID → (room, uid, name, face)。取不到就抛错。
+
+    先当房间号查，查不到再当 UID 反查 —— 后者是为了「直接粘主播 ID」也能用。
+    ⚠️ 两个号段理论上可能撞车（数字位数区分不了），所以卡片上同时显示房间号与 UID，
+       加错了用户一眼能看出来。
+    """
+    raw = str(text or "").strip()
+    m = re.search(r"live\.bilibili\.com/(?:h5/)?(\d+)", raw)
+    num = m.group(1) if m else (raw if raw.isdigit() else "")
+    if not num:
+        raise RuntimeError("请填房间号或直播间链接，例如 1727071052 "
+                           "或 https://live.bilibili.com/1727071052")
+    err = None
+    try:
+        info = _rc_room_info(num)
+        name, face = _rc_master(info["uid"])
+        return num, info["uid"], name or num, face
+    except Exception as e:
+        err = e
+    room = _rc_uid_room(num)
+    if room:
+        name, face = _rc_master(num)
+        return room, num, name or room, face
+    raise RuntimeError("这个号既不是房间号也不是 UID：%s" % str(err)[:80])
+
+
+RC_NAME_TOKENS = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*(?:\|[^}]*)?\}\}")
+RC_NAME_MAX_DEPTH = 3
+
+
+def _rc_safe_part(s, fallback=""):
+    """文件名/目录名的一段：去掉 Windows 不允许的字符，别让模板造出越级路径。"""
+    s = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", str(s or ""))
+    s = re.sub(r"\s+", " ", s).strip(" ._")
+    return s[:60] or fallback
+
+
+def _rc_name_values(room, name, uid, title, area, when=None, seq=0):
+    """模板可用变量。时间取**开录那一刻**，与文件名里的时间戳一致。"""
+    t = time.localtime(when or time.time())
+    return {
+        "roomid": str(room or ""),
+        "room": str(room or ""),
+        "uid": str(uid or ""),
+        "name": str(name or room or ""),
+        "title": str(title or name or room or ""),
+        "area": str(area or ""),
+        "time": time.strftime("%Y%m%d_%H%M%S", t),
+        "date": time.strftime("%Y-%m-%d", t),
+        "year": time.strftime("%Y", t),
+        "month": time.strftime("%m", t),
+        "day": time.strftime("%d", t),
+        "seq": "%02d" % int(seq or 0),
+    }
+
+
+def _rc_render_name(tpl, values):
+    """模板 → 相对路径（不含扩展名）。
+
+    BililiveRecorder 的模板写法允许用 `/` 分子目录（默认就是
+    `房间号-主播名/录制-房间号-时间`），这里同样支持，但只接受**相对**路径：
+    去掉开头的斜杠、丢掉 `..`，最多 3 层 —— 否则一个手滑的模板能把文件写到
+    `C:/Windows` 去（模板本身也进文件名，不能当代码执行）。
+    """
+    tpl = str(tpl or "").strip() or RC_DEFAULT_TEMPLATE
+
+    def sub(m):
+        k = m.group(1).lower()
+        return values.get(k, "")
+
+    raw = RC_NAME_TOKENS.sub(sub, tpl)
+    raw = raw.replace("\\", "/")
+    parts = []
+    for seg in raw.split("/"):
+        seg = _rc_safe_part(seg)
+        if not seg or seg in (".", ".."):
+            continue
+        parts.append(seg)
+        if len(parts) >= RC_NAME_MAX_DEPTH:
+            break
+    if not parts:
+        parts = [_rc_safe_part(values.get("name"), values.get("roomid") or "录制")]
+    return os.path.join(*parts)
+
+
+def _rc_out_base(doc, r, title="", area="", when=None, seq=0):
+    """该房间这一段的输出路径（不含扩展名）。
+
+    分段文件的区分靠模板里的时间（每段开录时刻不同），不再额外加 `_partNN` ——
+    用户按文件名找录像时，「录制-123-20261122_150000」比「..._part03」直观。
+    seq 仍保留：模板里可以用 `{{ seq }}` 自己编号。
+    """
+    st = doc["settings"]
+    tpl = RC_DEFAULT_TEMPLATE if st.get("filenameDefault", True) else st.get("filename")
+    rel = _rc_render_name(tpl, _rc_name_values(
+        r.get("room"), r.get("name"), r.get("uid"), title, area, when, seq))
+    outdir = _clip_check_dir(r.get("dir") or st["dir"]) or st["dir"]
+    base = os.path.join(outdir, rel)
+    n = 2
+    while os.path.exists(base + ".flv"):
+        base = "%s_%d" % (base, n)
+        n += 1
+    return base
+
+
+def _rc_skip_re(doc):
+    """录制条件：标题命中正则就跳过这一场。写坏的正则当没填（保存时会先校验）。"""
+    raw = str(doc["settings"].get("skipTitle") or "").strip()
+    if not raw:
+        return None
+    try:
+        return re.compile(raw)
+    except re.error:
+        return None
+
+
+def _rc_webhook(doc, event, data):
+    """Webhook v2 / v1。发不出去只记日志 —— 绝不能让它挡住录制。"""
+    pairs = [("v2", str(doc["settings"].get("webhookV2") or "").strip()),
+             ("v1", str(doc["settings"].get("webhookV1") or "").strip())]
+    targets = [(k, u) for k, u in pairs if u]
+    if not targets:
+        return
+
+    def run():
+        for kind, u in targets:
+            # v2 用 Event/EventData（与 BililiveRecorder v2 同形），v1 用扁平事件名
+            body = ({"Event": event, "EventData": data} if kind == "v2" else
+                    {"event": event, "data": data})
+            try:
+                req = urllib.request.Request(
+                    u, data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "User-Agent": UA})
+                with DIRECT_OPENER.open(req, timeout=6) as resp:
+                    resp.read(1)
+            except Exception as e:
+                _rc_log("Webhook %s 发送失败（%s）：%s" % (kind, event, str(e)[:80]),
+                        lv="warn")
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _rc_notify(title, msg, room="", name=""):
+    """开播/开录的系统通知。有托盘走托盘气泡，没有就只写日志。"""
+    _rc_log("%s：%s" % (title, msg), room, name, "ok")
+    try:
+        tray_balloon(title, msg, error=False)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- 后台应用图标（系统托盘）
+#
+# 只依赖 ctypes + Win32（不引 pystray / Pillow）：打包体积不变，也不新增 hidden-import。
+#
+# 设计要点（都是踩过的）：
+#   · 托盘只是**显示层**：创建失败、被关掉、Shell 重启，都不许影响录制线程；
+#     所有入口都吞异常，失败时 TRAY["failed"] 记一句，界面照常工作。
+#   · 必须有一个隐藏窗口承接回调（Shell_NotifyIcon 要 hWnd + 消息）。
+#   · 回调函数要挂在模块级变量上，否则被 GC 掉 → 点击图标直接崩。
+#   · 菜单里只提供「安全退出」：它会先给 ffmpeg 写 q 收尾，再关服务。
+TRAY = {"on": False, "ready": None, "hwnd": 0, "thread": None,
+        "failed": "", "tip": "", "icon": 0}
+TRAY_LOCK = threading.Lock()
+
+WM_TRAY = 0x8000 + 17          # WM_APP+17：图标回调
+WM_TRAY_EXIT = 0x8000 + 18     # 退出消息循环
+WM_TRAY_REFRESH = 0x8000 + 19  # 更新提示文字
+
+_TRAY_PROC = [None]            # 保住 WNDPROC 引用
+_TRAY_API = {}
+
+
+def _tray_api():
+    """懒加载 Win32 函数与常量。非 Windows / 加载失败返回 None。"""
+    if _TRAY_API:
+        return _TRAY_API or None
+    if os.name != "nt":
+        _TRAY_API["bad"] = True
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes as wt
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [("style", wt.UINT), ("lpfnWndProc", WNDPROC),
+                        ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                        ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON),
+                        ("hCursor", wt.HANDLE), ("hbrBackground", wt.HBRUSH),
+                        ("lpszMenuName", wt.LPCWSTR), ("lpszClassName", wt.LPCWSTR)]
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND),
+                        ("uID", wt.UINT), ("uFlags", wt.UINT),
+                        ("uCallbackMessage", wt.UINT), ("hIcon", wt.HICON),
+                        ("szTip", wt.WCHAR * 128), ("dwState", wt.DWORD),
+                        ("dwStateMask", wt.DWORD), ("szInfo", wt.WCHAR * 256),
+                        ("uVersion", wt.UINT), ("szInfoTitle", wt.WCHAR * 64),
+                        ("dwInfoFlags", wt.DWORD)]
+
+        _TRAY_API.update({
+            "ctypes": ctypes, "wt": wt, "user32": user32, "shell32": shell32,
+            "kernel32": kernel32, "WNDPROC": WNDPROC, "WNDCLASSW": WNDCLASSW,
+            "NID": NOTIFYICONDATAW, "LRESULT": LRESULT,
+            "NIM_ADD": 0, "NIM_MODIFY": 1, "NIM_DELETE": 2,
+            "NIF_MESSAGE": 1, "NIF_ICON": 2, "NIF_TIP": 4, "NIF_INFO": 0x10,
+            "NIIF_INFO": 1, "NIIF_WARNING": 2,
+            "WM_LBUTTONUP": 0x0202, "WM_LBUTTONDBLCLK": 0x0203,
+            "WM_RBUTTONUP": 0x0205, "WM_COMMAND": 0x0111, "WM_NULL": 0,
+            "TPM_RETURNCMD": 0x0100, "TPM_RIGHTBUTTON": 0x0002,
+            "MF_STRING": 0, "MF_SEPARATOR": 0x0800, "MF_GRAYED": 1,
+            "IMAGE_ICON": 1, "LR_LOADFROMFILE": 0x10, "LR_DEFAULTSIZE": 0x40,
+            "IDI_APPLICATION": 32512,
+        })
+        u = user32
+        u.DefWindowProcW.restype = LRESULT
+        u.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u.CreateWindowExW.restype = wt.HWND
+        u.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_int, wt.HWND, wt.HMENU,
+                                      wt.HINSTANCE, wt.LPVOID]
+        u.LoadImageW.restype = wt.HANDLE
+        u.LoadImageW.argtypes = [wt.HINSTANCE, wt.LPCWSTR, wt.UINT,
+                                 ctypes.c_int, ctypes.c_int, wt.UINT]
+        u.LoadIconW.restype = wt.HICON
+        u.LoadIconW.argtypes = [wt.HINSTANCE, wt.LPCWSTR]
+        u.CreatePopupMenu.restype = wt.HMENU
+        u.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, wt.WPARAM, wt.LPCWSTR]
+        u.TrackPopupMenu.restype = ctypes.c_int
+        u.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, wt.HWND, wt.LPVOID]
+        u.SetForegroundWindow.argtypes = [wt.HWND]
+        u.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+        u.DestroyMenu.argtypes = [wt.HMENU]
+        u.DestroyWindow.argtypes = [wt.HWND]
+        u.PostQuitMessage.argtypes = [ctypes.c_int]
+        u.RegisterClassW.restype = wt.ATOM
+        u.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        u.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+        u.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+        u.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+        kernel32.GetModuleHandleW.restype = wt.HMODULE
+        kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+        shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+        shell32.Shell_NotifyIconW.restype = wt.BOOL
+        return _TRAY_API
+    except Exception as e:
+        _TRAY_API["bad"] = True
+        try:
+            print("[tray] Win32 初始化失败：%s" % e)
+        except Exception:
+            pass
+        return None
+
+
+def _tray_menu_items():
+    n = _rc_busy_n()
+    return [
+        ("open", "打开控制台"),
+        ("state", ("录制中 · %d 路" % n) if n else "空闲（等待开播）"),
+        ("dir", "打开录制目录"),
+        ("sep", ""),
+        ("quit", "停止录制并退出（先写完文件）"),
+    ]
+
+
+def _tray_popup(hwnd):
+    A = _tray_api()
+    if not A:
+        return
+    ct, u, wt = A["ctypes"], A["user32"], A["wt"]
+    menu = u.CreatePopupMenu()
+    ids = {}
+    try:
+        i = 0
+        for key, label in _tray_menu_items():
+            if key == "sep":
+                u.AppendMenuW(menu, A["MF_SEPARATOR"], 0, None)
+            else:
+                i += 1
+                ids[i] = key
+                flags = A["MF_STRING"] | (A["MF_GRAYED"] if key == "state" else 0)
+                u.AppendMenuW(menu, flags, i, label)
+        u.SetForegroundWindow(hwnd)
+        cmd = u.TrackPopupMenu(menu, A["TPM_RETURNCMD"] | A["TPM_RIGHTBUTTON"],
+                               0, 0, 0, hwnd, None)
+        u.PostMessageW(hwnd, A["WM_NULL"], 0, 0)
+    finally:
+        u.DestroyMenu(menu)
+    key = ids.get(cmd)
+    if not key:
+        return
+    if key == "open":
+        open_browser(service_url())
+    elif key == "dir":
+        try:
+            d = _rc_doc()["settings"]["dir"]
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)
+        except Exception as e:
+            _rc_log("打开录制目录失败：%s" % str(e)[:80], lv="warn")
+    elif key == "quit":
+        _rc_log("托盘：停止录制并退出", lv="warn")
+        threading.Thread(target=rc_quit_async, daemon=True).start()
+
+
+def _tray_wndproc(hwnd, msg, wparam, lparam):
+    A = _tray_api()
+    if not A:
+        return 0
+    u = A["user32"]
+    if msg == WM_TRAY:
+        ev = int(lparam) & 0xFFFF
+        if ev in (A["WM_LBUTTONUP"], A["WM_LBUTTONDBLCLK"]):
+            open_browser(service_url())
+        elif ev == A["WM_RBUTTONUP"]:
+            _tray_popup(hwnd)
+        return 0
+    if msg == WM_TRAY_EXIT:
+        _tray_remove()
+        u.DestroyWindow(hwnd)
+        u.PostQuitMessage(0)
+        return 0
+    if msg == WM_TRAY_REFRESH:
+        _tray_apply_tip()
+        return 0
+    return u.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+def _tray_nid(flags):
+    A = _tray_api()
+    nid = A["NID"]()
+    nid.cbSize = A["ctypes"].sizeof(A["NID"])
+    nid.hWnd = TRAY["hwnd"]
+    nid.uID = 1
+    nid.uFlags = flags
+    nid.uCallbackMessage = WM_TRAY
+    nid.hIcon = TRAY["icon"]
+    nid.szTip = (TRAY["tip"] or "噼里啪啦")[:127]
+    return nid
+
+
+def _tray_apply_tip():
+    A = _tray_api()
+    if not A or not TRAY["hwnd"] or not TRAY["on"]:
+        return
+    try:
+        A["shell32"].Shell_NotifyIconW(A["NIM_MODIFY"], _tray_nid(A["NIF_TIP"]))
+    except Exception:
+        pass
+
+
+def _tray_remove():
+    A = _tray_api()
+    if not A or not TRAY["hwnd"]:
+        return
+    try:
+        A["shell32"].Shell_NotifyIconW(A["NIM_DELETE"], _tray_nid(0))
+    except Exception:
+        pass
+
+
+def _tray_thread():
+    A = _tray_api()
+    if not A:
+        TRAY["failed"] = "这台系统不支持托盘图标"
+        TRAY["ready"].set()
+        return
+    ct, u, wt = A["ctypes"], A["user32"], A["wt"]
+    try:
+        hinst = A["kernel32"].GetModuleHandleW(None)
+        cls = "ReplayRadioTrayWnd"
+        # ⚠️ 窗口类只注册一次、回调对象必须**永久**留住：
+        #    第二次 tray_start 时类已经注册（1410），如果这里换成新的 WNDPROC，
+        #    旧回调会被 GC，而类里存的还是旧指针 —— CreateWindowExW 一调 WndProc
+        #    就 access violation（实测崩在创建窗口那一行）。
+        proc = _TRAY_PROC[0]
+        if proc is None:
+            proc = A["WNDPROC"](_tray_wndproc)
+            _TRAY_PROC[0] = proc
+        wc = A["WNDCLASSW"]()
+        wc.lpfnWndProc = proc
+        wc.hInstance = hinst
+        wc.lpszClassName = cls
+        if not u.RegisterClassW(ct.byref(wc)):
+            err = ct.get_last_error()
+            if err not in (0, 1410):        # 1410 = 类已注册（重启托盘时）
+                raise RuntimeError("RegisterClassW 失败 %s" % err)
+        hwnd = u.CreateWindowExW(0, cls, "噼里啪啦", 0, 0, 0, 0, 0,
+                                 None, None, hinst, None)
+        if not hwnd:
+            raise RuntimeError("CreateWindowExW 失败 %s" % ct.get_last_error())
+        TRAY["hwnd"] = hwnd
+        ico = os.path.join(ROOT, "favicon.ico")
+        icon = 0
+        if os.path.exists(ico):
+            icon = u.LoadImageW(None, ico, A["IMAGE_ICON"], 16, 16,
+                                A["LR_LOADFROMFILE"])
+        if not icon:
+            icon = u.LoadIconW(None, wt.LPCWSTR(A["IDI_APPLICATION"]))
+        TRAY["icon"] = icon
+        TRAY["tip"] = "噼里啪啦"
+        nid = _tray_nid(A["NIF_MESSAGE"] | A["NIF_ICON"] | A["NIF_TIP"])
+        if not A["shell32"].Shell_NotifyIconW(A["NIM_ADD"], nid):
+            raise RuntimeError("Shell_NotifyIcon 添加失败")
+        TRAY["on"] = True
+        TRAY["failed"] = ""
+        TRAY["ready"].set()
+        msg = wt.MSG()
+        while u.GetMessageW(ct.byref(msg), None, 0, 0) > 0:
+            u.TranslateMessage(ct.byref(msg))
+            u.DispatchMessageW(ct.byref(msg))
+    except Exception as e:
+        TRAY["failed"] = str(e)[:120]
+        TRAY["on"] = False
+        if TRAY["ready"]:
+            TRAY["ready"].set()
+        try:
+            print("[tray] 创建失败：%s" % e)
+        except Exception:
+            pass
+    finally:
+        TRAY["on"] = False
+        TRAY["hwnd"] = 0
+
+
+def tray_start():
+    """按设置显示托盘图标。已经显示就只刷新提示。返回是否成功。"""
+    if TRAY["on"]:
+        tray_tip("噼里啪啦")
+        return True
+    if TRAY["thread"] is not None and TRAY["thread"].is_alive():
+        return False
+    TRAY["ready"] = threading.Event()
+    TRAY["failed"] = ""
+    t = threading.Thread(target=_tray_thread, name="tray", daemon=True)
+    TRAY["thread"] = t
+    t.start()
+    TRAY["ready"].wait(3.0)
+    if TRAY["on"]:
+        _rc_log("后台应用图标已显示（托盘）")
+    elif TRAY["failed"]:
+        _rc_log("后台应用图标没有显示：%s（不影响录制）" % TRAY["failed"], lv="warn")
+    return bool(TRAY["on"])
+
+
+def tray_stop():
+    """隐藏图标。⚠️ 只关显示层，**不动** RC_PROC / 调度线程。"""
+    if not TRAY["on"]:
+        return
+    A = _tray_api()
+    if not A:
+        return
+    try:
+        A["user32"].PostMessageW(TRAY["hwnd"], WM_TRAY_EXIT, 0, 0)
+    except Exception:
+        pass
+    TRAY["on"] = False
+    _rc_log("后台应用图标已隐藏（录制继续）")
+
+
+def tray_tip(text=None):
+    """更新悬停提示；传 None 时按当前录制路数自动生成。"""
+    if not TRAY["on"]:
+        return
+    if text is None:
+        n = _rc_busy_n()
+        text = ("噼里啪啦 · 录制中 %d 路" % n) if n else "噼里啪啦 · 空闲"
+    text = str(text)[:120]
+    if text == TRAY["tip"]:
+        return
+    TRAY["tip"] = text
+    A = _tray_api()
+    if not A:
+        return
+    try:
+        A["user32"].PostMessageW(TRAY["hwnd"], WM_TRAY_REFRESH, 0, 0)
+    except Exception:
+        pass
+
+
+def tray_balloon(title, msg, error=False):
+    """托盘气泡通知（开播通知用）。没有图标时静默跳过。"""
+    if not TRAY["on"]:
+        return
+    A = _tray_api()
+    if not A:
+        return
+    try:
+        nid = _tray_nid(A["NIF_INFO"])
+        nid.szInfoTitle = str(title)[:63]
+        nid.szInfo = str(msg)[:255]
+        nid.dwInfoFlags = A["NIIF_WARNING"] if error else A["NIIF_INFO"]
+        A["shell32"].Shell_NotifyIconW(A["NIM_MODIFY"], nid)
+    except Exception:
+        pass
+
+
+def tray_sync(show):
+    """设置页那个开关的入口。"""
+    if show:
+        return tray_start()
+    tray_stop()
+    return False
+
+
+# ---- 弹幕保存 -------------------------------------------------------------
+# 与录制并行的一条 WS：把 DANMU_MSG 写成 B 站播放器认得的 XML 侧车文件。
+# 它**完全独立**于录制进程 —— 弹幕连不上只少一份 XML，录制照旧。
+DM_LOCK = threading.Lock()
+
+
+def _rc_danmu_info(room):
+    """按**指定房间**取弹幕网关（api_live_danmu_info 用的是「当前主播」，这里不能用）。"""
+    url = wbi_signed("https://api.live.bilibili.com/xlive/web-room/v1/index/getDanmuInfo",
+                     {"id": str(room), "type": "0"})
+    d = bili_get(url, "https://live.bilibili.com/%s" % room)
+    if d.get("code") != 0:
+        raise RuntimeError("弹幕网关 code=%s" % d.get("code"))
+    data = d.get("data") or {}
+    hosts = [{"host": h.get("host"), "wss_port": h.get("wss_port") or 443}
+             for h in (data.get("host_list") or []) if h.get("host")]
+    return {"token": data.get("token") or "", "hosts": hosts}
+
+
+def _rc_dm_write(entry, line):
+    fh = entry.get("fh")
+    if not fh:
+        return
+    try:
+        with DM_LOCK:
+            fh.write(line)
+            fh.flush()
+    except Exception:
+        pass
+
+
+def _rc_dm_line(info, start_ts):
+    """DANMU_MSG → 一行 <d p="...">。解析不出来返回空串。"""
+    try:
+        meta = info[0] or []
+        text = str(info[1] or "")
+        who = info[2] or []
+        style = info[3] or []
+        ts = float(meta[4] or 0) / 1000.0
+        rel = max(0.0, ts - start_ts) if ts else 0.0
+        mode = int(meta[1] if len(meta) > 1 else 1) or 1
+        size = int(style[0] if style else 25) or 25
+        color = int(style[1] if len(style) > 1 else 16777215) or 16777215
+        uid = int(who[0] or 0) if who else 0
+        p = "%.2f,%d,%d,%d,%d,0,%d,0" % (rel, mode, size, color,
+                                         int(ts * 1000) if ts else 0, uid)
+        return '<d p="%s">%s</d>\n' % (p, html.escape(text, quote=False))
+    except Exception:
+        return ""
+
+
+def _rc_dm_parse(data, entry, start_ts):
+    off = 0
+    n = 0
+    while off + 16 <= len(data):
+        ln = struct.unpack(">I", data[off:off + 4])[0]
+        if ln < 16 or off + ln > len(data):
+            break
+        ver = struct.unpack(">H", data[off + 6:off + 8])[0]
+        op = struct.unpack(">I", data[off + 8:off + 12])[0]
+        body = data[off + 16:off + ln]
+        if op == 5 and ver in (2, 3):
+            if ver == 2:
+                try:
+                    n += _rc_dm_parse(zlib.decompress(body), entry, start_ts)
+                except Exception:
+                    pass
+        elif op == 5 and ver == 0:
+            try:
+                j = json.loads(body.decode("utf-8", "replace"))
+                if str(j.get("cmd") or "").startswith("DANMU_MSG") and j.get("info"):
+                    line = _rc_dm_line(j["info"], start_ts)
+                    if line:
+                        _rc_dm_write(entry, line)
+                        entry["n"] = int(entry.get("n") or 0) + 1
+            except Exception:
+                pass
+        elif op == 5:
+            n += _rc_dm_parse(body, entry, start_ts)
+        off += ln
+    return n
+
+
+def _rc_dm_worker(room, path, start_ts, stop, entry):
+    try:
+        if self_uid() <= 0:
+            _rc_log("未登录 B 站，跳过弹幕保存", room, entry.get("name"), "warn")
+            return
+    except Exception:
+        return
+    try:
+        fh = open(path, "w", encoding="utf-8", newline="\n")
+    except OSError as e:
+        entry["err"] = str(e)[:100]
+        return
+    entry["fh"] = fh
+    try:
+        with DM_LOCK:
+            fh.write('<?xml version="1.0" encoding="UTF-8"?><i>'
+                     "<chatserver>chat.bilibili.com</chatserver><chatid>%s</chatid>"
+                     "<mission>0</mission><maxlimit>100000</maxlimit><state>0</state>"
+                     "<real_name>0</real_name><source>k-v</source>\n" % room)
+            fh.flush()
+        while not stop.is_set():
+            sock = None
+            try:
+                info = _rc_danmu_info(room)
+                if not info["hosts"]:
+                    raise RuntimeError("没取到弹幕网关")
+                host = info["hosts"][0]["host"]
+                port = info["hosts"][0]["wss_port"]
+                sess = load_credentials()[0]
+                ck = "buvid3=%s; b_nut=%d" % (bili_buvid3(), int(time.time()))
+                if sess:
+                    ck = "SESSDATA=%s; %s" % (sess, ck)
+                sock = _ws_handshake(host, port, "/sub", {
+                    "Origin": "https://live.bilibili.com", "User-Agent": UA, "Cookie": ck})
+                _ws_send(sock, _bili_pack(json.dumps({
+                    "uid": self_uid(), "roomid": int(room), "proto_ver": 2,
+                    "buvid": bili_buvid3(), "platform": "web", "clientver": "1.14.3",
+                    "type": 2, "key": info["token"]}).encode(), 7))
+                entry["err"] = ""
+                last_hb = time.time()
+                while not stop.is_set():
+                    if time.time() - last_hb > 25:
+                        _ws_send(sock, _bili_pack(b"", 2))
+                        last_hb = time.time()
+                    try:
+                        opcode, data = _ws_recv(sock, 3)
+                    except socket.timeout:
+                        continue
+                    if opcode is None:
+                        raise RuntimeError("网关关闭了连接")
+                    if opcode == 2:
+                        _rc_dm_parse(data, entry, start_ts)
+                    elif opcode == 9:
+                        _ws_send(sock, data, opcode=10)
+                    elif opcode == 8:
+                        raise RuntimeError("网关要求关闭")
+            except Exception as e:
+                if stop.is_set():
+                    break
+                msg = "%s: %s" % (type(e).__name__, str(e)[:80])
+                if entry.get("err") != msg:
+                    entry["err"] = msg
+                    _rc_log("弹幕保存中断（%s），3 秒后重连" % msg, room, entry.get("name"), "warn")
+                time.sleep(3)
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+    finally:
+        try:
+            with DM_LOCK:
+                fh.write("</i>\n")
+                fh.close()
+        except Exception:
+            pass
+        entry["fh"] = None
+
+
+def _rc_dm_start(room, path, start_ts, name=""):
+    """开一条弹幕保存线程。
+
+    ⚠️ 登录检查放在线程里做：self_uid() 是网络请求，放在 _rc_launch（调度线程）里
+       会卡住整个房间扫描；放在这里最多影响这一路的 XML。
+    """
+    stop = threading.Event()
+    entry = {"stop": stop, "xml": path, "n": 0, "err": "", "name": name}
+    t = threading.Thread(target=_rc_dm_worker,
+                         args=(str(room), path, start_ts, stop, entry),
+                         name="dm-%s" % room, daemon=True)
+    with REC_LOCK:
+        old = RC_DM.get(str(room))
+        RC_DM[str(room)] = entry
+    if old:
+        try:
+            old["stop"].set()
+        except Exception:
+            pass
+    t.start()
+    entry["thread"] = t
+
+
+def _rc_dm_stop(room, wait=2.0):
+    with REC_LOCK:
+        entry = RC_DM.pop(str(room), None)
+    if not entry:
+        return
+    try:
+        entry["stop"].set()
+        t = entry.get("thread")
+        if t is not None:
+            t.join(wait)
+    except Exception:
+        pass
+
+
+def _rc_cover_save(url, path):
+    if not url:
+        return
+
+    def run():
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": UA, "Referer": "https://live.bilibili.com/"})
+            with DIRECT_OPENER.open(req, timeout=15) as resp:
+                data = resp.read(4 * 1024 * 1024)
+            if data:
+                with open(path, "wb") as f:
+                    f.write(data)
+        except Exception:
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def _rc_qn(doc):
+    """按「逗号分割的画质ID」取第一个可用档位（原画优先）。"""
+    for x in str(doc["settings"].get("qnIds") or "").split(","):
+        x = x.strip()
+        if x.isdigit() and int(x) in RC_QN_VALID:
+            return int(x)
+    return doc["settings"].get("qn") or RC_QN
+
+
+def _rc_kill(room, why="", rotate=False):
+    """停掉这一路的 ffmpeg。
+
+    先给它 stdin 写一个 `q`（ffmpeg 的交互退出键）：它会把当前包写完、把文件尾部
+    收干净再退。直接 terminate 会截在任意位置 —— FLV 还能播，但最后几秒容易丢。
+    卡住不响应时才退回强杀。
+
+    rotate=True 表示「自动分段换文件」，此时不把状态置回 idle、也不发收尾 webhook
+    之外的通知（新的一路马上接上）。
+    """
+    room = str(room)
+    p = RC_PROC.pop(room, None)
+    rt = _rc_rt(room)
+    _rc_dm_stop(room, 2.0)
+    if p is not None:
+        clean = False
+        try:
+            if p.stdin:
+                p.stdin.write(b"q")
+                p.stdin.flush()
+                p.stdin.close()
+            p.wait(timeout=6)
+            clean = True
+        except Exception:
+            pass
+        if not clean:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                pass
+        try:
+            got = os.path.getsize(rt["file"]) if rt.get("file") else 0
+        except OSError:
+            got = 0
+        rt["bytes"] = got
+        _rc_log("结束录制（%s，%s，%.1f MB）" % (
+            why or "手动停止", "正常收尾" if clean else "强制结束", got / 1024.0 ** 2),
+            room, rt.get("name") or "", "warn" if not clean else "info")
+        if not rotate:
+            _rc_webhook(_rc_doc(), "SessionEnded", {
+                "RoomId": int(room) if room.isdigit() else 0,
+                "Name": rt.get("name") or "",
+                "Title": rt.get("liveTitle") or rt.get("title") or "",
+                "FilePath": rt.get("file") or "",
+                "FileSize": got,
+                "Duration": max(0, int(time.time() - (rt.get("since") or time.time()))),
+                "Reason": why or "手动停止",
+            })
+    if not rotate:
+        rt.update(state="idle", since=0, pid=0)
+    return p is not None
+
+
+def _rc_launch(doc, r):
+    """起一路录制。失败抛异常，由调度器记进该房间的 error。"""
+    st = doc["settings"]
+    room = str(r["room"])
+    rt = _rc_rt(room)
+    outdir = _clip_check_dir(r.get("dir") or st["dir"]) or st["dir"]
+    os.makedirs(outdir, exist_ok=True)
+    ff = seg_ffmpeg()
+    if not ff:
+        raise RuntimeError("本机没找到 ffmpeg，无法录制")
+    # 录制要「现在就新鲜」的地址：播放器那个缓存 TTL 是给 <video> 用的，别复用
+    LIVE_URL_CACHE.pop(room, None)
+    try:
+        info = _rc_room_info(room)
+    except Exception:
+        info = {"title": rt.get("title") or "", "area": "", "cover": ""}
+    qn = _rc_qn(doc)
+    play = live_play_url(room, qn)
+    now = time.time()
+    # 开了任何一种分段就带 _partNN；否则单一文件（更接近「一场一个文件」的习惯）
+    seg_no = int(rt.get("segNo") or 0)
+    if st["segment"] != "none" or st["segmentTitle"]:
+        seg_no += 1
+    base = _rc_out_base(doc, r, info.get("title") or rt.get("title"),
+                        info.get("area") or rt.get("area"), now, seg_no)
+    os.makedirs(os.path.dirname(base) or outdir, exist_ok=True)
+    out = base + ".flv"
+    hdr = "Referer: https://live.bilibili.com/\r\nUser-Agent: %s\r\n" % UA
+    # 「标准模式录制修复设置」在这里落地：原始数据模式下什么都不加
+    extra = []
+    if st["mode"] == "standard":
+        if st["repairMissing"]:
+            extra += ["-fflags", "+genpts+discardcorrupt"]
+        if st["repairGlitch"]:
+            extra += ["-err_detect", "ignore_err"]
+    cmd = [ff, "-hide_banner", "-loglevel", "error"] + extra + [
+           # 断线自动重连：B 站 FLV 拉流偶尔会断，ffmpeg 自己接得上就不用重启进程
+           "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+           "-headers", hdr,
+           "-i", play["url"], "-c", "copy", "-f", "flv", "-y", out]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with REC_LOCK:
+        RC_PROC[room] = p
+    rt.update(state="recording", since=now, file=out, bytes=0, error="", pid=p.pid,
+              next=0, living=True, segNo=seg_no, liveTitle=info.get("title") or "",
+              title=info.get("title") or rt.get("title"), area=info.get("area") or "",
+              name=r.get("name") or room, cover=base + ".cover.jpg",
+              xml=base + ".xml", titleAt=now, skip="")
+    _rc_log("开始录制 → %s" % os.path.basename(out), room, r.get("name"), "ok")
+    if st["cover"]:
+        _rc_cover_save(info.get("cover"), base + ".cover.jpg")
+    if st["danmaku"]:
+        _rc_dm_start(room, base + ".xml", now, r.get("name"))
+    _rc_webhook(doc, "SessionStarted", {
+        "RoomId": int(room) if room.isdigit() else 0,
+        "Name": r.get("name") or "",
+        "Title": info.get("title") or "",
+        "FilePath": out,
+        "Qn": qn,
+    })
+    if st["notify"]:
+        _rc_notify("开始录制", "%s · %s" % (r.get("name") or room,
+                                          (info.get("title") or "直播中")[:40]),
+                   room, r.get("name"))
+    tray_tip(None)
+
+
+def _rc_rotate(doc, r, why):
+    """分段换文件：先正常收尾，再立刻接上下一段（不经过调度等待）。"""
+    room = str(r["room"])
+    _rc_kill(room, why, rotate=True)
+    try:
+        _rc_launch(doc, r)
+    except Exception as e:
+        rt = _rc_rt(room)
+        rt.update(state="error", error=str(e)[:140], since=0, pid=0)
+        rt["next"] = time.time() + 20
+        _rc_log("分段后重开失败：%s" % str(e)[:120], room, r.get("name"), "err")
+
+
+def _rc_tick():
+    doc = _rc_doc()
+    st = doc["settings"]
+    now = time.time()
+    live_n = 0
+    for p in list(RC_PROC.values()):
+        try:
+            if p.poll() is None:
+                live_n += 1
+        except Exception:
+            pass
+    skip_re = _rc_skip_re(doc)
+    for r in doc["rooms"]:
+        room = str(r["room"])
+        rt = _rc_rt(room)
+        p = RC_PROC.get(room)
+        if p is not None:
+            if p.poll() is None:
+                try:
+                    rt["bytes"] = os.path.getsize(rt["file"]) if rt["file"] else 0
+                except OSError:
+                    pass
+                # 自动分段：按大小 / 按时间
+                size_mb = (rt.get("bytes") or 0) / 1024.0 ** 2
+                mins = (now - (rt.get("since") or now)) / 60.0
+                if ((st["segment"] == "size" and size_mb >= st["segmentSize"])
+                        or (st["segment"] == "time"
+                            and mins >= st["segmentMinutes"])):
+                    _rc_rotate(doc, r, "自动分段")
+                    continue
+                # 改标题分段：每 2 分钟问一次（不查的话标题只在开播时那次请求里）
+                if st["segmentTitle"] and now - (rt.get("titleAt") or 0) > 120:
+                    rt["titleAt"] = now
+                    try:
+                        info = _rc_room_info(room)
+                        new_title = info.get("title") or ""
+                        if new_title and rt.get("liveTitle") and new_title != rt["liveTitle"]:
+                            _rc_log("直播间改了标题（%s）→ 分段" % new_title[:40],
+                                    room, r.get("name"))
+                            _rc_rotate(doc, r, "标题变更")
+                            continue
+                        if new_title:
+                            rt["liveTitle"] = new_title
+                            rt["title"] = new_title
+                        rt["living"] = info.get("living")
+                    except Exception:
+                        pass
+                continue
+            RC_PROC.pop(room, None)
+            live_n = max(0, live_n - 1)
+            rc = p.returncode
+            # 流不稳的直播间会「连上—断—再连」，每次只落几百 KB。若不退避，
+            # 一小时能攒出几百个碎文件（实测某房间 7 秒就 EOF）。
+            # 判据用**刚结束那个文件的大小**：像样的录制至少几 MB。
+            try:
+                got = os.path.getsize(rt["file"]) if rt["file"] else 0
+            except OSError:
+                got = 0
+            _rc_dm_stop(room, 1.0)
+            if got < 1024 * 1024:
+                rt["tinyN"] = int(rt.get("tinyN") or 0) + 1
+            else:
+                rt["tinyN"] = 0
+            back = min(90, 6 * max(1, int(rt.get("tinyN") or 0)))
+            rt.update(state="waiting" if r["enabled"] else "idle", pid=0, since=0)
+            rt["next"] = now + back
+            _rc_log("录制进程结束（退出码 %s，%.0f KB）%s" % (
+                rc, got / 1024.0, "，%d 秒后重试" % back if r["enabled"] else ""),
+                room, r.get("name"), "warn" if rc or got < 1024 * 1024 else "info")
+            _rc_webhook(doc, "SessionEnded", {
+                "RoomId": int(room) if room.isdigit() else 0,
+                "Name": r.get("name") or "",
+                "Title": rt.get("liveTitle") or rt.get("title") or "",
+                "FilePath": rt.get("file") or "",
+                "FileSize": got,
+                "Duration": max(0, int(now - (rt.get("since") or now))),
+                "Reason": "流中断" if rc else "主播下播",
+            })
+            if st["notify"] and got >= 1024 * 1024:
+                _rc_notify("录制结束", "%s · %.1f MB" % (r.get("name") or room,
+                                                        got / 1024.0 ** 2),
+                           room, r.get("name"))
+            if int(rt.get("tinyN") or 0) == 3:
+                _rc_log("这个直播间连续 3 次只录到不到 1MB，像是在测试或推流不稳；"
+                        "已放慢重试，不再频繁新开文件", room, r.get("name"), "err")
+            tray_tip(None)
+            continue
+        if not r["enabled"]:
+            if rt["state"] != "idle":
+                rt.update(state="idle", since=0, pid=0, error="")
+            continue
+        if RC_EXITING[0]:
+            # 页面已关、正在等收尾：不再开新的文件，让当前这一段写完就走
+            if rt["state"] != "waiting":
+                rt.update(state="waiting", error="页面已关闭，收尾后退出")
+            continue
+        if now < (rt.get("next") or 0):
+            continue
+        try:
+            info = _rc_room_info(room)
+        except Exception as e:
+            rt.update(state="error", error=str(e)[:140])
+            rt["next"] = now + RC_POLL
+            _rc_log("查询开播失败：%s" % str(e)[:120], room, r.get("name"), "err")
+            continue
+        rt["title"] = info["title"]
+        rt["area"] = info.get("area") or rt.get("area") or ""
+        rt["living"] = info["living"]
+        if not info["living"]:
+            rt.update(state="waiting", error="")
+            rt["next"] = now + RC_POLL
+            continue
+        if skip_re is not None and skip_re.search(info["title"] or ""):
+            rt.update(state="waiting", error="标题命中跳过规则")
+            rt["next"] = now + RC_POLL
+            if rt.get("skip") != info["title"]:
+                rt["skip"] = info["title"]
+                _rc_log("标题「%s」命中跳过规则，不录这一场" % (info["title"] or "")[:40],
+                        room, r.get("name"), "warn")
+            continue
+        rt["skip"] = ""
+        if live_n >= RC_MAX_LIVE:
+            rt.update(state="waiting", error="")
+            rt["next"] = now + 20
+            _rc_log("同时录制已达上限 %d 路，这一路稍后再试" % RC_MAX_LIVE,
+                    room, r.get("name"), "warn")
+            continue
+        outdir = _clip_check_dir(r.get("dir") or st["dir"]) or st["dir"]
+        free = _rc_disk(outdir)["free"]
+        if free and free < RC_MIN_FREE:
+            rt.update(state="error", error="磁盘剩余不足 2GB")
+            rt["next"] = now + 120
+            _rc_log("磁盘剩余 %.1f GB，低于 2GB 不开新录制" % (free / 1024.0 ** 3),
+                    room, r.get("name"), "err")
+            continue
+        try:
+            _rc_launch(doc, r)
+            live_n += 1
+        except Exception as e:
+            rt.update(state="error", error=str(e)[:140])
+            rt["next"] = now + 30
+            _rc_log("开录失败：%s" % str(e)[:120], room, r.get("name"), "err")
+    tray_tip(None)
+
+
+def _rc_loop():
+    while True:
+        try:
+            _rc_tick()
+        except Exception as e:
+            _rc_log("调度异常：%s" % str(e)[:160], lv="err")
+        time.sleep(RC_TICK)
+
+
+def _rc_ensure_loop():
+    """懒启动调度线程 —— 不在 import 时起，避免打包/导入产生副作用。"""
+    with REC_LOCK:
+        t = RC_LOOP.get("thread")
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=_rc_loop, name="recorder", daemon=True)
+        RC_LOOP["thread"] = t
+    t.start()
+
+
+def _rc_room_payload(doc, r):
+    """配置 + 运行态合成一条（配置落盘、状态只在内存）。"""
+    with REC_LOCK:
+        rt = dict(RC_RT.get(str(r["room"])) or {})
+    out = dict(r)
+    out.update(state=rt.get("state") or "idle",
+               since=int(rt.get("since") or 0),
+               file=os.path.basename(rt.get("file") or ""),
+               filePath=rt.get("file") or "",
+               bytes=int(rt.get("bytes") or 0),
+               error=rt.get("error") or "",
+               pid=int(rt.get("pid") or 0),
+               title=rt.get("title") or "",
+               liveTitle=rt.get("liveTitle") or "",
+               area=rt.get("area") or "",
+               segNo=int(rt.get("segNo") or 0),
+               hasXml=bool(rt.get("xml") and os.path.exists(rt.get("xml"))),
+               hasCover=bool(rt.get("cover") and os.path.exists(rt.get("cover"))),
+               living=bool(rt.get("living")))
+    return out
+
+
+def recorder_kick():
+    """应用启动就进入「持续检测」：auto 开着时把所有房间置为监控。
+
+    这是「打开软件就自动等开播、开播就录」的落点 —— 调度线程本身早就在跑，
+    缺的只是「房间的 enabled 初始为真」。没有它，用户每次启动都要逐个点开始。
+    """
+    try:
+        doc = _rc_doc()
+        if doc["settings"].get("auto", True):
+            off = [r for r in doc["rooms"] if not r["enabled"]]
+            if off:
+                for r in off:
+                    r["enabled"] = True
+                _rc_save(doc)
+                _rc_log("自动录制：%d 个房间已置为监控" % len(off))
+        _rc_ensure_loop()
+        _rc_log("录制调度已启动（%d 个房间%s）" % (
+            len(doc["rooms"]), "，自动录制开" if doc["settings"].get("auto", True) else ""))
+        # 后台应用图标按设置显示。失败不影响录制（tray_start 内部吞异常）
+        if doc["settings"].get("tray", True):
+            tray_start()
+    except Exception as e:
+        print("[recorder] 启动调度失败：%s" % e)
+
+
+def api_rc_state(query):
+    """GET /api/recorder/state —— 房间 + 运行态 + 设置 + 磁盘 + 日志尾部。"""
+    _rc_ensure_loop()
+    doc = _rc_doc()
+    disk = _rc_disk(_clip_check_dir(doc["settings"]["dir"]) or doc["settings"]["dir"])
+    with REC_LOCK:
+        log = list(RC_LOG[-120:])
+    return 200, {"settings": doc["settings"], "defaultDir": _rc_default_dir(),
+                 "template": RC_DEFAULT_TEMPLATE,
+                 "ffmpeg": seg_ffmpeg(), "maxLive": RC_MAX_LIVE,
+                 "minFree": RC_MIN_FREE, "maxRooms": RC_MAX_ROOMS,
+                 "disk": disk, "now": time.time(), "log": log,
+                 "busy": _rc_busy_n(), "exiting": bool(RC_EXITING[0]),
+                 "tray": {"on": bool(TRAY["on"]), "failed": TRAY["failed"]},
+                 "rooms": [_rc_room_payload(doc, r) for r in doc["rooms"]]}
+
+
+def api_rc_files(query):
+    """GET /api/recorder/files?room= —— 已录文件（按修改时间倒序）。"""
+    room = (query.get("room", [""])[0] or "").strip()
+    doc = _rc_doc()
+    if room:
+        hit = next((r for r in doc["rooms"] if r["room"] == room), None)
+        if not hit:
+            return 404, {"error": "没有这个房间"}
+        targets = [(hit["room"], hit.get("name") or hit["room"],
+                    hit.get("dir") or doc["settings"]["dir"])]
+    else:
+        targets = [(r["room"], r.get("name") or r["room"],
+                    r.get("dir") or doc["settings"]["dir"]) for r in doc["rooms"]]
+    out = []
+    seen = set()
+    for rm, nm, d in targets:
+        d2 = _clip_check_dir(d)
+        if not d2 or not os.path.isdir(d2):
+            continue
+        try:
+            names = os.listdir(d2)
+        except OSError:
+            continue
+        for f in names:
+            if not f.lower().endswith(".flv"):
+                continue
+            fp = os.path.join(d2, f)
+            # 多个房间用同一个输出目录时（默认就是），同一文件只会被扫一次
+            if fp in seen:
+                continue
+            try:
+                stt = os.stat(fp)
+            except OSError:
+                continue
+            seen.add(fp)
+            out.append({"room": rm, "name": nm, "file": f, "size": stt.st_size,
+                        "mtime": int(stt.st_mtime), "dir": d2,
+                        "path": fp})
+    out.sort(key=lambda x: -x["mtime"])
+    return 200, {"files": out[:300], "total": len(out),
+                 "dir": doc["settings"]["dir"]}
+
+
+def api_rc_add(obj):
+    """POST /api/recorder/add {input} —— 房间号 / 直播间链接 / 主播 UID。"""
+    _rc_ensure_loop()
+    doc = _rc_doc()
+    if len(doc["rooms"]) >= RC_MAX_ROOMS:
+        return 400, {"error": "最多 %d 个房间，先删掉不用的" % RC_MAX_ROOMS}
+    try:
+        room, uid, name, face = _rc_parse(obj.get("input"))
+    except Exception as e:
+        return 400, {"error": str(e)[:160]}
+    if any(r["room"] == room for r in doc["rooms"]):
+        return 400, {"error": "这个直播间已经加过了（房间 %s）" % room}
+    # 自动录制开着时，加进来就开始监控 —— 用户不必再点一次「开始监控」
+    doc["rooms"].append({"room": room, "uid": uid, "name": name, "face": face,
+                         "enabled": bool(doc["settings"].get("auto", True)), "dir": ""})
+    _rc_save(doc)
+    _rc_log("添加房间 %s" % room, room, name, "ok")
+    return 200, {"ok": True, "room": room, "name": name, "uid": uid}
+
+
+def api_rc_remove(obj):
+    room = str(obj.get("room") or "")
+    doc = _rc_doc()
+    hit = next((r for r in doc["rooms"] if r["room"] == room), None)
+    if not hit:
+        return 404, {"error": "没有这个房间"}
+    _rc_kill(room, "房间已删除")
+    doc["rooms"] = [r for r in doc["rooms"] if r["room"] != room]
+    _rc_save(doc)
+    with REC_LOCK:
+        RC_RT.pop(room, None)
+    _rc_log("删除房间 %s" % room, room, hit.get("name"), "warn")
+    return 200, {"ok": True}
+
+
+def api_rc_start(obj):
+    """POST /api/recorder/start {room} —— 开始监控（未开播就等）。"""
+    _rc_ensure_loop()
+    room = str(obj.get("room") or "")
+    doc = _rc_doc()
+    hit = next((r for r in doc["rooms"] if r["room"] == room), None)
+    if not hit:
+        return 404, {"error": "没有这个房间"}
+    if not hit["enabled"]:
+        hit["enabled"] = True
+        _rc_save(doc)
+    rt = _rc_rt(room)
+    rt["next"] = 0                     # 立刻查一次，不用等下一轮
+    if rt["state"] in ("idle", "error"):
+        rt.update(state="waiting", error="")
+    _rc_log("开始监控", room, hit.get("name"), "ok")
+    return 200, {"ok": True}
+
+
+def api_rc_stop(obj):
+    """POST /api/recorder/stop {room} —— 停止监控并结束该路录制。"""
+    room = str(obj.get("room") or "")
+    doc = _rc_doc()
+    hit = next((r for r in doc["rooms"] if r["room"] == room), None)
+    if not hit:
+        return 404, {"error": "没有这个房间"}
+    if hit["enabled"]:
+        hit["enabled"] = False
+        _rc_save(doc)
+    killed = _rc_kill(room, "手动停止")
+    rt = _rc_rt(room)
+    rt.update(state="idle", error="")
+    _rc_log("停止监控%s" % ("（录制已结束）" if killed else ""), room, hit.get("name"), "warn")
+    return 200, {"ok": True, "wasRecording": killed}
+
+
+def _rc_bool(v):
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
+def api_rc_settings(obj):
+    """POST /api/recorder/settings —— 增量保存。只处理请求里出现的键。"""
+    doc = _rc_doc()
+    st = doc["settings"]
+    if "dir" in obj:
+        d = _clip_check_dir(obj.get("dir"))
+        if not d:
+            return 400, {"error": "目录不合法：要绝对路径，且不能是系统目录"}
+        st["dir"] = d
+    if "qn" in obj:
+        try:
+            qn = int(obj.get("qn"))
+        except (TypeError, ValueError):
+            qn = RC_QN
+        st["qn"] = qn if qn in RC_QN_VALID else RC_QN
+    if "qnIds" in obj:
+        raw = re.sub(r"[^0-9,]", "", str(obj.get("qnIds") or ""))
+        ids = [x for x in raw.split(",") if x.strip()]
+        bad = [x for x in ids if int(x) not in RC_QN_VALID]
+        if bad:
+            return 400, {"error": "画质 ID 只支持 %s"
+                                  % "、".join(str(x) for x in RC_QN_VALID)}
+        st["qnIds"] = ",".join(ids[:6]) or "10000,400,250,150"
+    if "mode" in obj:
+        st["mode"] = "raw" if str(obj.get("mode")) == "raw" else "standard"
+    if "segment" in obj:
+        seg = str(obj.get("segment") or "none")
+        if seg not in ("none", "size", "time"):
+            return 400, {"error": "自动分段方式不合法"}
+        st["segment"] = seg
+    if "segmentSize" in obj:
+        try:
+            st["segmentSize"] = max(16, min(10240, int(obj.get("segmentSize"))))
+        except (TypeError, ValueError):
+            return 400, {"error": "分片大小要填 16~10240 MB"}
+    if "segmentMinutes" in obj:
+        try:
+            st["segmentMinutes"] = max(1, min(720, int(obj.get("segmentMinutes"))))
+        except (TypeError, ValueError):
+            return 400, {"error": "分片时长要填 1~720 分钟"}
+    if "filename" in obj:
+        tpl = str(obj.get("filename") or "")[:200]
+        if tpl.count("{{") != tpl.count("}}"):
+            return 400, {"error": "文件名模板的 {{ }} 没有配对"}
+        st["filename"] = tpl
+    if "skipTitle" in obj:
+        raw = str(obj.get("skipTitle") or "")[:500]
+        if raw.strip():
+            try:
+                re.compile(raw)
+            except re.error as e:
+                return 400, {"error": "跳过规则不是合法正则：%s" % str(e)[:80]}
+        st["skipTitle"] = raw
+    for k in ("webhookV2", "webhookV1"):
+        if k in obj:
+            u = str(obj.get(k) or "").strip()[:300]
+            if u and not re.match(r"^https?://", u, re.I):
+                return 400, {"error": "Webhook 地址必须以 http:// 或 https:// 开头"}
+            st[k] = u
+    for k in ("auto", "tray", "danmaku", "repairMissing", "repairGlitch",
+              "segmentTitle", "cover", "filenameDefault", "notify"):
+        if k in obj:
+            st[k] = _rc_bool(obj.get(k))
+    # 打开自动录制时把现有房间一并置为监控（否则「打开了却还在等用户点」）。
+    # ⚠️ 只在本次请求真的改了 auto 时才做：否则用户手动停掉的房间会被
+    #    「保存任意一个设置」重新打开（看着像停止按钮失效）。
+    if "auto" in obj and st["auto"]:
+        for r in doc["rooms"]:
+            r["enabled"] = True
+    _rc_save(doc)
+    if "tray" in obj:
+        try:
+            tray_sync(st["tray"])
+        except Exception as e:
+            _rc_log("切换后台图标失败：%s（不影响录制）" % str(e)[:80], lv="warn")
+    return 200, {"ok": True, "settings": st, "tray": {"on": bool(TRAY["on"]),
+                                                     "failed": TRAY["failed"]}}
+
+
+def api_rc_name_test(obj):
+    """POST /api/recorder/name_test {template, filenameDefault} —— 模板预览。"""
+    doc = _rc_doc()
+    tpl = (RC_DEFAULT_TEMPLATE if _rc_bool(obj.get("filenameDefault"))
+           else str(obj.get("template") or ""))[:200]
+    r = doc["rooms"][0] if doc["rooms"] else {"room": "123456", "name": "主播名",
+                                             "uid": "10000"}
+    rel = _rc_render_name(tpl, _rc_name_values(
+        r.get("room"), r.get("name"), r.get("uid"), "直播标题", "虚拟主播", time.time(), 1))
+    return 200, {"ok": True, "rel": rel, "full": os.path.join(
+        _clip_check_dir(doc["settings"]["dir"]) or doc["settings"]["dir"], rel) + ".flv"}
+
+
+def api_rc_pick(obj):
+    doc = _rc_doc()
+    cur = _clip_check_dir(doc["settings"]["dir"]) or _rc_default_dir()
+    p = _pick_dir_win32(cur)
+    if p is None:
+        return 501, {"error": "这个系统不支持原生文件夹选择，请直接输入路径"}
+    if p == "":
+        return 200, {"ok": False, "cancelled": True}
+    return 200, {"ok": True, "dir": p}
+
+
+def api_rc_reveal(obj):
+    """POST /api/recorder/reveal {path} —— 在资源管理器里定位某个录制文件。
+
+    只允许配置过的输出目录下的文件（这是本机服务，但也不能变成任意路径探测器）。
+    """
+    p = os.path.abspath(str(obj.get("path") or "").strip())
+    doc = _rc_doc()
+    roots = [doc["settings"]["dir"]] + [r.get("dir") for r in doc["rooms"] if r.get("dir")]
+    inside = False
+    for d in roots:
+        d = _clip_check_dir(d) or ""
+        if not d:
+            continue
+        try:
+            if os.path.commonpath([p, os.path.abspath(d)]) == os.path.abspath(d):
+                inside = True
+                break
+        except ValueError:
+            pass
+    if not inside or not os.path.exists(p):
+        return 400, {"error": "这个文件不在录制目录里"}
+    if os.name != "nt":
+        return 501, {"error": "只支持 Windows"}
+    try:
+        subprocess.Popen(["explorer.exe", "/select,", p])
+    except OSError as e:
+        return 400, {"error": str(e)}
+    return 200, {"ok": True}
+
+
+def api_rc_open(obj):
+    """POST /api/recorder/open {room?} —— 在资源管理器里打开输出目录。"""
+    room = str(obj.get("room") or "")
+    doc = _rc_doc()
+    d = doc["settings"]["dir"]
+    if room:
+        hit = next((r for r in doc["rooms"] if r["room"] == room), None)
+        if not hit:
+            return 404, {"error": "没有这个房间"}
+        d = hit.get("dir") or d
+    d = _clip_check_dir(d) or doc["settings"]["dir"]
+    if not os.path.isdir(d):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as e:
+            return 400, {"error": "目录不存在且创建失败：%s" % e}
+    if os.name != "nt":
+        return 501, {"error": "只支持 Windows"}
+    try:
+        os.startfile(d)                 # noqa: 仅 Windows 有
+    except OSError as e:
+        return 400, {"error": str(e)}
+    return 200, {"ok": True, "dir": d}
 
 
 def api_status(force=False):
@@ -2499,6 +4380,98 @@ def live_play_url(room, qn):
     return c
 
 
+# 新版取流接口：老 playUrl 对一部分直播间（B 站新的 HLS/fMP4 流）直接报
+# 19001012「调用bvc-play-url-one出错」，但它只影响 **FLV**，状态接口仍是准的。
+# 所以这里补一条 HLS 通道：状态照常显示直播中，取流时再用本机 ffmpeg 转成 FLV
+# 交给原有的 mpegts 播放链路（前端一行都不用改）。
+LIVE_PLAYINFO_API = "https://api.live.bilibili.com/xlive/web-room/v2/index/getRoomPlayInfo"
+_LIVE_HLS_CACHE = {}
+LIVE_HLS_TTL = 60
+
+
+def _live_room_info(room):
+    """按房间号取权威开播状态（get_info 不需要登录，也不受新版流影响）。"""
+    room = str(room or "")
+    d = bili_get("%s?room_id=%s" % (LIVE_ROOM_INFO_API, urllib.parse.quote(room)),
+                 "https://live.bilibili.com/%s" % room, fallback_anon=True)
+    if d.get("code") != 0:
+        raise RuntimeError("直播间信息 code=%s" % d.get("code"))
+    x = d.get("data") or {}
+    if not str(x.get("room_id") or "").isdigit():
+        raise RuntimeError("直播间不存在")
+    try:
+        start = int(x.get("live_time") or 0)
+    except (TypeError, ValueError):
+        start = 0
+    return {"uid": str(x.get("uid") or ""), "room_id": str(x.get("room_id") or room),
+            "living": int(x.get("live_status") or 0) == 1,
+            "title": x.get("title") or "", "area": x.get("area_name") or "",
+            "cover": x.get("keyframe") or x.get("user_cover") or "",
+            "online": int(x.get("online") or 0), "start": start}
+
+
+def _live_hls_url(room, qn):
+    """新版 getRoomPlayInfo → HLS(fMP4) 地址。
+
+    一个房间通常只有一种协议（老房间给 http_stream/flv，新房间只给 http_hls）。
+    这里只挑 avc 编码：mpegts.js 与 FLV 都只认 H.264。
+    """
+    room = str(room or "")
+    now = time.time()
+    hit = _LIVE_HLS_CACHE.get(room)
+    if hit and now - hit["at"] < LIVE_HLS_TTL:
+        return hit
+    url = (LIVE_PLAYINFO_API + "?room_id=%s&protocol=0,1&format=0,1,2&codec=0,1"
+           "&qn=%s&platform=web&ptype=8&dolby=5&panorama=1"
+           % (urllib.parse.quote(room), urllib.parse.quote(str(qn))))
+    d = bili_get(url, "https://live.bilibili.com/%s" % room, fallback_anon=True)
+    if d.get("code") != 0:
+        raise RuntimeError("新版取流 code=%s" % d.get("code"))
+    p = (((d.get("data") or {}).get("playurl_info") or {}).get("playurl") or {})
+    desc = {int(g.get("qn") or 0): g.get("desc") or ""
+            for g in (p.get("g_qn_desc") or [])}
+    for st in (p.get("stream") or []):
+        for fm in (st.get("format") or []):
+            for co in (fm.get("codec") or []):
+                if str(co.get("codec_name") or "") != "avc":
+                    continue
+                infos = co.get("url_info") or []
+                base = co.get("base_url") or ""
+                if not infos or not base:
+                    continue
+                u = infos[0]
+                full = (u.get("host") or "") + base + (u.get("extra") or "")
+                cur = int(co.get("current_qn") or qn)
+                acc = [int(x) for x in (co.get("accept_qn") or []) if str(x).isdigit()]
+                out = {"at": now, "qn": qn, "kind": "hls", "url": full,
+                       "current_qn": cur,
+                       "qualities": [{"qn": q, "desc": desc.get(q) or str(q)}
+                                     for q in acc]}
+                _LIVE_HLS_CACHE[room] = out
+                return out
+    raise RuntimeError("新版取流没有可用的 H.264 通道")
+
+
+def _fill_live_stream(out, room, qn):
+    """先试 FLV（老接口），失败再试 HLS。返回 True 表示拿到了可取流的地址。
+
+    ⚠️ living 与「取不取得到流」必须分开：状态接口说在播就显示直播中，
+       取流失败只写 error，绝不把在播判成未开播（19001012 就是这么骗人的）。
+    """
+    try:
+        c = live_play_url(room, qn)
+        out.update(qualities=c["qualities"], current_qn=c["current_qn"])
+        return True
+    except Exception as e1:
+        try:
+            h = _live_hls_url(room, qn)
+            out.update(qualities=h["qualities"], current_qn=h["current_qn"], hls=True)
+            return True
+        except Exception as e2:
+            out["error"] = "直播中，但取流失败：%s；HLS：%s" % (str(e1)[:50], str(e2)[:50])
+            return False
+
+
 # ---------------------------------------------------------------- 关注列表（监控室）
 # 读**登录账号**的关注列表，过滤出正在直播的 —— 监控室「关注的直播」的数据源。
 # 两步：followings 翻页拿 uid（必须带 SESSDATA）→ get_status_info_by_uids 批量查开播。
@@ -2602,6 +4575,63 @@ def _following_uids():
     FOLLOW_CACHE["uids_at"] = now
     print("[follow] 关注名单 %d 人（%d 页，并发 %d）" % (len(out), pages, FOLLOW_WORKERS))
     return out
+
+
+FOLLOW_PEOPLE_CACHE = {"at": 0.0, "list": []}
+FOLLOW_PEOPLE_TTL = 300
+
+
+def _following_people(force=False):
+    """关注的人 + 昵称/头像/是否有直播间（批量添加主播用）。
+
+    ⚠️ get_status_info_by_uids 只返回**有直播间**的账号；没有直播间的关注直接略过 ——
+    加进电台也播不了，列出来只会让人以为漏了。
+    """
+    now = time.time()
+    if (not force and FOLLOW_PEOPLE_CACHE["list"]
+            and now - FOLLOW_PEOPLE_CACHE["at"] < FOLLOW_PEOPLE_TTL):
+        return list(FOLLOW_PEOPLE_CACHE["list"])
+    uids = _following_uids()
+    batches = [uids[i:i + FOLLOW_BATCH] for i in range(0, len(uids), FOLLOW_BATCH)]
+
+    def one(batch):
+        q = "&".join("uids[]=%s" % u for u in batch)
+        try:
+            d = _follow_json("https://api.live.bilibili.com/room/v1/Room/"
+                             "get_status_info_by_uids?%s" % q,
+                             "https://live.bilibili.com/")
+        except Exception as e:
+            print("[follow] 批量资料取失败：%s" % e)
+            return None
+        if d.get("code") != 0:
+            return None
+        return d.get("data") or {}
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(FOLLOW_WORKERS, max(1, len(batches)))) as ex:
+        got = list(ex.map(one, batches))
+    if any(g is None for g in got):
+        raise RuntimeError("关注资料有部分批次取失败，请稍后重试")
+    people = []
+    for data in got:
+        for uid, info in data.items():
+            room = str(info.get("room_id") or "")
+            if not room or room == "0":
+                continue
+            people.append({
+                "mid": str(uid),
+                "uname": info.get("uname") or "",
+                "face": info.get("face") or "",
+                "room": room,
+                "title": info.get("title") or "",
+                "area": info.get("area_v2_name") or "",
+                "living": int(info.get("live_status") or 0) == 1,
+            })
+    # 在播优先；没昵称的排到最后（API 偶尔缺 uname，别让它占住列表顶部）
+    people.sort(key=lambda x: (not x["living"], not bool(x["uname"]), x["uname"]))
+    FOLLOW_PEOPLE_CACHE["list"] = people
+    FOLLOW_PEOPLE_CACHE["at"] = now
+    return list(people)
 
 
 def _follow_batch(batch):
@@ -2760,6 +4790,79 @@ def api_following_live(force=False):
     ms = int((time.time() - t0) * 1000)
     print("[follow] 取到 %d 位在播，耗时 %d ms" % (len(live), ms))
     return 200, {"list": live, "ms": ms}
+
+
+def api_stations_following(force=False):
+    """GET /api/stations/following —— 关注列表（带是否已添加），供首页批量添加。"""
+    if not self_uid():
+        return 401, {"error": "需要登录：先在设置页扫码登录 B 站，才能读取关注列表"}
+    try:
+        people = _following_people(force)
+    except Exception as e:
+        return 502, {"error": str(e)}
+    added = {str(s.get("mid")) for s in load_stations(force=True)}
+    for p in people:
+        p["added"] = p["mid"] in added
+    return 200, {"list": people, "total": len(people),
+                 "added": sum(1 for p in people if p["added"])}
+
+
+def api_stations_bulk(obj):
+    """POST /api/stations/bulk {mids:[...]} —— 批量添加关注的人。
+
+    只写 stations.json（名字/房间/头像），**不探测合集系列**：几十位一起探测会
+    打几十次接口、等几十秒。回放来源可以之后在设置里单个补。
+    """
+    raw = obj.get("mids")
+    if not isinstance(raw, list) or not raw:
+        return 400, {"error": "没有选中任何人"}
+    mids = []
+    for x in raw:
+        x = str(x or "").strip()
+        if x.isdigit() and x not in mids:
+            mids.append(x)
+    if not mids:
+        return 400, {"error": "选中的条目不是有效 UID"}
+    if len(mids) > 40:
+        return 400, {"error": "一次最多添加 40 位"}
+    doc = _stations_doc_read()
+    items = [s for s in doc["stations"] if isinstance(s, dict)]
+    exist = {str(s.get("mid")) for s in items}
+    todo = [m for m in mids if m not in exist]
+    skipped = [m for m in mids if m in exist]
+    data = {}
+    for i in range(0, len(todo), FOLLOW_BATCH):
+        batch = todo[i:i + FOLLOW_BATCH]
+        q = "&".join("uids[]=%s" % u for u in batch)
+        try:
+            d = _follow_json("https://api.live.bilibili.com/room/v1/Room/"
+                             "get_status_info_by_uids?%s" % q,
+                             "https://live.bilibili.com/")
+        except Exception as e:
+            return 502, {"error": "取主播资料失败：%s" % str(e)[:80]}
+        if d.get("code") != 0:
+            return 502, {"error": "取主播资料 code=%s" % d.get("code")}
+        data.update(d.get("data") or {})
+    added, failed = [], []
+    for mid in todo:
+        info = data.get(mid) or {}
+        room = str(info.get("room_id") or "")
+        if not room or room == "0":
+            failed.append({"mid": mid, "error": "这个账号没有直播间"})
+            continue
+        if len(items) >= MAX_STATIONS:
+            failed.append({"mid": mid, "error": "最多 %d 位主播" % MAX_STATIONS})
+            continue
+        name = str(info.get("uname") or ("主播 " + mid))[:128]
+        items.append({"id": mid, "mid": mid, "main": not items,
+                      "name": name, "short": name, "room": room,
+                      "face": str(info.get("face") or "")[:512]})
+        added.append({"mid": mid, "name": name})
+    if added:
+        doc["stations"] = items
+        _stations_doc_write(doc)
+    FOLLOW_PEOPLE_CACHE["at"] = 0.0        # 下次读关注列表时重新算 added
+    return 200, {"ok": True, "added": added, "skipped": skipped, "failed": failed}
 
 
 # --- 添加任意直播间（监控室）：房间号 / 直播间链接 / b23.tv 短链 → 可直接播的卡片 ---
@@ -4239,12 +6342,7 @@ def api_live_playinfo(query):
                    area=live.get("area") or "", start=live.get("start") or 0,
                    url=live.get("url") or "")
         if out["living"] and out["room_id"]:
-            try:
-                info = live_play_url(out["room_id"], DEFAULT_LIVE_QN)
-                out["qualities"] = info["qualities"]
-                out["current_qn"] = info["current_qn"]
-            except Exception as e:
-                out["error"] = str(e)
+            _fill_live_stream(out, out["room_id"], DEFAULT_LIVE_QN)
         return 200, out
     out = {"room_id": cur_room(), "mid": cur_mid(), "station": station_head()}
     try:
@@ -4270,67 +6368,109 @@ def api_live_playinfo(query):
                area=live.get("area") or "", start=live.get("start") or 0,
                url=live.get("url") or "")
     if out["living"]:
-        try:
-            info = live_play_url(cur_room(), DEFAULT_LIVE_QN)
-            out["qualities"] = info["qualities"]
-            out["current_qn"] = info["current_qn"]
-        except Exception as e:
-            out["error"] = str(e)
+        _fill_live_stream(out, cur_room(), DEFAULT_LIVE_QN)
     return 200, out
+
+
+def _open_live_stream(room, qn):
+    """打开一路直播字节流：先 FLV（老接口），失败再 HLS→ffmpeg 转 FLV。
+
+    返回 (stream, proc, err)。stream 同时支持 read1/read；
+    proc 是 HLS 转封装时的 ffmpeg 进程，FLV 直连时为 None。
+    """
+    room = str(room or "")
+    try:
+        media = live_play_url(room, qn)["url"]
+        req = urllib.request.Request(media, headers={
+            "User-Agent": UA, "Referer": "https://live.bilibili.com/%s" % room,
+            "Accept": "*/*",
+        })
+        return urlopen(req, 30), None, ""
+    except Exception as e1:
+        try:
+            h = _live_hls_url(room, qn)
+        except Exception:
+            return None, None, "取直播流失败：%s" % bili_err(e1)
+        ff = seg_ffmpeg()
+        if not ff:
+            return None, None, "取直播流失败：%s（且没有 ffmpeg 可转 HLS）" % bili_err(e1)
+        try:
+            from auto_segments import NO_WINDOW, HIDE_SI
+        except Exception:
+            NO_WINDOW, HIDE_SI = 0, None
+        hdr = "Referer: https://live.bilibili.com/%s\r\nUser-Agent: %s\r\n" % (room, UA)
+        cmd = [ff, "-hide_banner", "-loglevel", "error", "-headers", hdr,
+               "-i", h["url"], "-c", "copy", "-f", "flv", "pipe:1"]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                    creationflags=NO_WINDOW, startupinfo=HIDE_SI)
+        except OSError as e:
+            return None, None, "启动 ffmpeg 失败：%s" % e
+        return proc.stdout, proc, ""
+
+
+def _close_live_stream(stream, proc):
+    try:
+        if stream:
+            stream.close()
+    except Exception:
+        pass
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                proc.wait(timeout=3)
+        except Exception:
+            pass
 
 
 def api_live_stream(handler, query):
     """转发直播流。直播是持续流，不支持 Range；断开由客户端决定（关页面 / 切走）。
 
     ?room=<真实房间号>：播**注册表之外**的直播间（监控室「关注的直播」用）；
-    不带则跟当前板块走（原有行为不变）。
+    不带则跟当前板块走（原有行为不变）。新版 HLS 房间由本机 ffmpeg 转成 FLV 再转发。
     """
     room = (query.get("room", [""])[0] or "").strip() or cur_room()
     qn = parse_int(query.get("qn", ["0"])[0], DEFAULT_LIVE_QN)
-    try:
-        media = live_play_url(room, qn)["url"]
-    except Exception as e:
-        return 502, {"error": "取直播流失败：%s" % bili_err(e)}
-    req = urllib.request.Request(media, headers={
-        "User-Agent": UA, "Referer": "https://live.bilibili.com/%s" % room,
-        "Accept": "*/*",
-    })
-    try:
-        resp = urlopen(req, 30)
-    except Exception as e:
-        return 502, {"error": "连接直播流失败：%s" % e}
+    stream, proc, err = _open_live_stream(room, qn)
+    if err:
+        return 502, {"error": err}
     handler.send_response(200)
     handler.send_header("Content-Type", "video/x-flv")
     handler.end_headers()
     try:
         while True:
-            chunk = resp.read(262144)
+            chunk = stream.read1(WS_CHUNK)
             if not chunk:
                 break
             handler.wfile.write(chunk)
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
         pass                       # 观众关页面 / 切走，属正常断开
     finally:
-        try:
-            resp.close()
-        except Exception:
-            pass
+        _close_live_stream(stream, proc)
     return None, None
 
 
 def playinfo_by_room(room):
-    """按**房间号**确认「这一路现在能不能播」，只打一次 playUrl（比按 uid 查少一趟接口）。
+    """按**房间号**确认「这一路现在能不能播」。
 
-    监控室「关注的直播」在左栏就已经拿到了标题 / 主播名 / 是否在播，这里只为画质档位
-    与一次确认：取不到流地址就是「没在播 / 刚下播」。
+    ⚠️ 开播状态以 get_info 的 live_status 为准，**不能**用「取不到 FLV 地址」推断未开播：
+    新版 HLS/fMP4 房间的 playUrl 会报 19001012，但它们确实在播（2026-11-22 实测
+    13308358）。取流失败只写 error，状态仍是直播中。
     """
     out = {"room_id": str(room), "mid": "", "living": False}
     try:
-        info = live_play_url(room, DEFAULT_LIVE_QN)
+        meta = _live_room_info(room)
     except Exception as e:
-        out["error"] = str(e)
+        out["error"] = "开播状态获取失败：%s" % str(e)[:60]
         return out
-    out.update(living=True, qualities=info["qualities"], current_qn=info["current_qn"])
+    out.update(mid=meta["uid"], room_id=meta["room_id"], living=meta["living"],
+               title=meta["title"], area=meta["area"], cover=meta["cover"],
+               online=meta["online"], start=meta["start"])
+    if not meta["living"]:
+        return out
+    _fill_live_stream(out, room, DEFAULT_LIVE_QN)
     return out
 
 
@@ -4421,21 +6561,15 @@ def api_live_ws(handler, query):
     if not ws_accept(handler):
         return
     handler.close_connection = True          # 别指望这条连接还能再收 HTTP 请求
-    try:
-        media = live_play_url(room, qn)["url"]
-        req = urllib.request.Request(media, headers={
-            "User-Agent": UA, "Referer": "https://live.bilibili.com/%s" % room,
-            "Accept": "*/*",
-        })
-        resp = urlopen(req, 30)
-    except Exception as e:
+    stream, proc, err = _open_live_stream(room, qn)
+    if err:
         # 握手已经回过 101 了，只能用「一条关闭帧」把失败告诉前端
         try:
             handler.wfile.write(struct.pack("!BBH", 0x88, 2, 1011))
             handler.wfile.flush()
         except Exception:
             pass
-        print("[play] ws 房间 %s 取流失败：%s" % (room, bili_err(e)))
+        print("[play] ws 房间 %s 取流失败：%s" % (room, err))
         return
     try:
         while True:
@@ -4451,17 +6585,14 @@ def api_live_ws(handler, query):
             #    每隔两秒才到一批数据，缓冲一空就 waiting，追帧再 seek 一次
             #    就可能彻底停住（表现为「播一阵后画面定住、状态还是直播中」）。
             #    read1(n) 有多少返回多少，最多 n 字节 → 到货即转发，抖动 < 100ms。
-            chunk = resp.read1(WS_CHUNK)
+            chunk = stream.read1(WS_CHUNK)
             if not chunk:
                 break
             handler.wfile.write(ws_frame(chunk))
     except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
         pass                       # 观众关页面 / 取消勾选，属正常断开
     finally:
-        try:
-            resp.close()
-        except Exception:
-            pass
+        _close_live_stream(stream, proc)
 
 
 def api_live_credential(obj):
@@ -5768,13 +7899,15 @@ def _seg_busy():
 
 
 def _exit_now():
-    """关掉网页就退出 —— 但**正在补分段时不走**。
+    """关掉网页就退出 —— 但**正在补分段 / 正在录制时不走**。
 
-    分析一整场回放要十几分钟到半小时，而分段跑在 daemon 线程里，进程一死它就跟着没。
-    于是「页面一关」= 排队里的几期永远补不完：每次开页面都从头开始，进度永远停在 0，
-    自动更新看着就像坏了。所以没跑完就先不退，每 30 秒再看一次；
-    超过 SEG_EXIT_GRACE 照退 —— 已完成的分P 都落盘了，下次接着补，不会白干。
-    /api/quit（脚本 / 命令行停止）直接 shutdown，不走这条路，始终立即生效。
+    分段：分析一整场回放要十几分钟，进程一死 daemon 线程就跟着没。
+    录制：写盘中途被杀会丢最后几秒（强杀更糟），所以一发现有录制在写，
+          就只是把进程留在后台，每 15 秒看一次；写完后自动退出。
+          ⚠️ 这里**不做超时**：用户明确要求「不得因页面关闭而中断录制」。
+          页面关掉期间也不会再开新录制（见 _rc_tick 里的 RC_EXITING 判断），
+          所以当前这一段结束就是退出点。
+    /api/quit 与托盘的「停止录制并退出」走 rc_quit_async：先正常收尾再关服务。
     """
     if _seg_busy():
         now = time.time()
@@ -5787,12 +7920,76 @@ def _exit_now():
             _schedule_exit(30.0)
             return
         print("等分段超时，先退出（下次启动会接着补）")
+    if _rc_busy():
+        n = _rc_busy_n()
+        if not RC_EXITING[0]:
+            RC_EXITING[0] = time.time()
+            _rc_log("网页已关闭，但还有 %d 路录制在写盘 —— 后台继续录，"
+                    "文件写完自动退出" % n, lv="warn")
+            tray_tip("噼里啪啦 · 收尾中（%d 路录制）" % n)
+        _schedule_exit(15.0)
+        return
+    if RC_EXITING[0]:
+        RC_EXITING[0] = 0.0
+        _rc_log("录制已收尾，后台进程退出", lv="ok")
     srv = SERVER_REF[0]
     if srv:
         try:
             srv.shutdown()       # main() 的 serve_forever 会随即返回，进程正常退出
         except Exception:
             pass
+
+
+def service_url():
+    srv = SERVER_REF[0]
+    try:
+        return "http://127.0.0.1:%d/" % srv.server_address[1]
+    except Exception:
+        return "http://127.0.0.1:8765/"
+
+
+def rc_finalize_all(why="应用退出"):
+    """把所有录制正常收尾（写 q、等 ffmpeg 落盘），并停掉弹幕侧车。
+
+    这是「安全退出」的唯一入口：托盘退出、/api/quit、主循环结束都走它。
+    单路失败只记日志，不影响其它路 —— 但会等每一路自己写完。
+    """
+    with REC_LOCK:
+        rooms = list(RC_PROC.keys())
+    for room in rooms:
+        try:
+            _rc_kill(room, why)
+        except Exception as e:
+            _rc_log("收尾 %s 失败：%s" % (room, str(e)[:80]), room, lv="err")
+    with REC_LOCK:
+        dms = list(RC_DM.keys())
+    for room in dms:
+        try:
+            _rc_dm_stop(room, 3.0)
+        except Exception:
+            pass
+
+
+def rc_quit_async(why="应用退出"):
+    """安全退出：先收尾（可能阻塞几秒），再关服务。必须跑在独立线程里。"""
+    try:
+        _rc_log("正在收尾录制并退出…", lv="warn")
+        try:
+            tray_balloon("正在停止录制", "文件写完后自动退出，请稍候…")
+        except Exception:
+            pass
+        rc_finalize_all(why)
+    finally:
+        try:
+            tray_stop()
+        except Exception:
+            pass
+        srv = SERVER_REF[0]
+        if srv:
+            try:
+                srv.shutdown()
+            except Exception:
+                pass
 
 
 def _schedule_exit(delay):
@@ -5818,6 +8015,9 @@ def page_alive(cid):
         PAGES[cid] = time.time()
         PAGES_SEEN[0] = True
     SEG_EXIT_DEADLINE[0] = 0.0       # 页面回来了，之前那次「等分段」的宽限期作废
+    if RC_EXITING[0]:
+        RC_EXITING[0] = 0.0
+        _rc_log("页面重新连上，继续按房间检测开播", lv="ok")
     _cancel_exit()
     return 200, {"ok": True}
 
@@ -6457,16 +8657,39 @@ class Handler(SimpleHTTPRequestHandler):
                                     "build": read_build_stamp(), "ban_left": _left})
         if parsed.path == "/api/quit":
             # 供「停止」脚本调用。服务只绑 127.0.0.1，外部访问不到。
-            # shutdown() 要等 serve_forever 退出，必须另起线程，否则会把当前响应卡死。
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            # ⚠️ 现在要先给正在录的 ffmpeg 写 q 收尾（否则最后几秒丢），
+            #    shutdown() 也要等 serve_forever 退出，所以统一丢到线程里做。
+            threading.Thread(target=rc_quit_async, args=("停止服务",),
+                             daemon=True).start()
             return self._json(200, {"ok": True})
         if parsed.path == "/api/playurl":
             code, obj = api_playurl(q)
             return self._json(code, obj)
         if parsed.path == "/api/clip/status":
             return self._json(*api_clip_status())
+        if parsed.path in ("/api/clip/cover", "/api/clip/cover/preview"):
+            if parsed.path == "/api/clip/cover":
+                code, ct, body = api_clip_cover(q.get("path", [""])[0])
+            else:
+                code, ct, body = api_clip_cover_preview(
+                    q.get("path", [""])[0], q.get("index", [""])[0],
+                    q.get("orient", [""])[0])
+            if code != 200 or body is None:
+                return self._json(code, {"error": "封面不可用"})
+            self.send_response(200)
+            self.send_header("Content-Type", ct or "image/png")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path == "/api/songcut/status":
             return self._json(*api_songcut_status(q))
+        if parsed.path == "/api/recorder/state":
+            return self._json(*api_rc_state(q))
+        if parsed.path == "/api/recorder/files":
+            return self._json(*api_rc_files(q))
         if parsed.path == "/api/dd/actions":
             return self._json(*api_dd_actions(q))
         if parsed.path == "/api/dd/profile":
@@ -6533,6 +8756,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(code, obj)
         if parsed.path == "/api/stations":
             return self._json(*api_stations())
+        if parsed.path == "/api/stations/following":
+            return self._json(*api_stations_following("refresh" in q))
         if parsed.path == "/api/dynamic":
             return self._json(*api_dynamic(q))
         if parsed.path == "/api/weibo":
@@ -6641,6 +8866,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(*api_playlist_tag(obj))
         if parsed.path == "/api/stations/probe":
             return self._json(*api_stations_probe(obj))
+        if parsed.path == "/api/stations/bulk":
+            return self._json(*api_stations_bulk(obj))
         if parsed.path == "/api/stations/save":
             return self._json(*api_stations_save(obj))
         if parsed.path == "/api/stations/delete":
@@ -6661,8 +8888,28 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(*api_songcut_start(obj))
         if parsed.path == "/api/songcut/apply":
             return self._json(*api_songcut_apply(obj))
+        if parsed.path == "/api/recorder/add":
+            return self._json(*api_rc_add(obj))
+        if parsed.path == "/api/recorder/remove":
+            return self._json(*api_rc_remove(obj))
+        if parsed.path == "/api/recorder/start":
+            return self._json(*api_rc_start(obj))
+        if parsed.path == "/api/recorder/stop":
+            return self._json(*api_rc_stop(obj))
+        if parsed.path == "/api/recorder/settings":
+            return self._json(*api_rc_settings(obj))
+        if parsed.path == "/api/recorder/pick":
+            return self._json(*api_rc_pick(obj))
+        if parsed.path == "/api/recorder/open":
+            return self._json(*api_rc_open(obj))
+        if parsed.path == "/api/recorder/name_test":
+            return self._json(*api_rc_name_test(obj))
+        if parsed.path == "/api/recorder/reveal":
+            return self._json(*api_rc_reveal(obj))
         if parsed.path == "/api/clip/pick":
             return self._json(*api_clip_pick(obj))
+        if parsed.path == "/api/clip/cover/choose":
+            return self._json(*api_clip_cover_choose(obj))
         if parsed.path == "/api/series/refresh":
             return self._json(*api_series_refresh(obj))
         if parsed.path == "/api/page/bye":
@@ -7830,13 +10077,22 @@ def main():
     start_page_watchdog()
     # 回放清单自动发现：只填了 name + UID 的主播靠这一步补齐（后台跑，不挡启动）
     series_kick()
-    print("  退出时机：网页全部关闭后自动退出（另有 %d 分钟无心跳兜底）"
-          % int(PAGE_IDLE // 60))
+    # 录播姬：启动即开始按房间检测开播（auto 开着时不需要手动点「开始监控」）
+    recorder_kick()
+    print("  退出时机：网页全部关闭后自动退出（正在录制时会先等文件写盘；"
+          "另有 %d 分钟无心跳兜底）" % int(PAGE_IDLE // 60))
 
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n已停止")
+    finally:
+        # 不管从哪条路退出（/api/quit、托盘、Ctrl+C），都先让 ffmpeg 正常收尾
+        try:
+            rc_finalize_all("应用退出")
+        except Exception as e:
+            print("[recorder] 收尾异常：%s" % e)
+        tray_stop()
     return 0
 
 

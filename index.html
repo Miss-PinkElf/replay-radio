@@ -156,10 +156,12 @@ window.__BOOT_T0 = Date.now();
   <div class="ob-card ob-card-form" id="ob-form" hidden>
     <div class="ob-row">
       <input id="ob-mid" type="text" inputmode="numeric" autocomplete="off" spellcheck="false"
-             placeholder="主播 UID" aria-label="主播 UID">
+             placeholder="B 站 UID（必填）" aria-label="B 站 UID（必填）">
       <button class="btn primary" id="ob-probe" type="button">检测</button>
     </div>
-    <p class="ob-hint">UID 是个人主页网址里那串数字：<b>space.bilibili.com/1512246445</b></p>
+    <p class="ob-hint"><b>必须填 B 站 UID</b> —— 个人主页地址
+      <b>space.bilibili.com/1512246445</b> 里那串数字。<br>
+      不是直播间号，也不是昵称；直接粘贴直播间链接也可以，会自动换算成对应的 UID。</p>
 
     <div class="ob-result" id="ob-result"></div>
 
@@ -185,6 +187,22 @@ window.__BOOT_T0 = Date.now();
     </div>
 
     <button class="btn primary ob-go" id="ob-save" type="button" hidden>就听 TA 的 →</button>
+
+    <div class="ob-bulk" id="ob-bulk">
+      <button class="ob-bulk-open" id="ob-bulk-open" type="button">从关注列表批量添加 →</button>
+      <div class="ob-bulk-box" id="ob-bulk-box" hidden>
+        <div class="ob-bulk-bar">
+          <input class="ob-bulk-filter" id="ob-bulk-filter" type="search"
+                 placeholder="搜索昵称或 UID" autocomplete="off" aria-label="搜索关注">
+          <span class="ob-bulk-stat" id="ob-bulk-stat">正在读取关注列表…</span>
+          <button class="ob-bulk-link" id="ob-bulk-clear" type="button">清空选择</button>
+          <button class="btn small primary" id="ob-bulk-add" type="button" disabled>添加选中的 0 位</button>
+        </div>
+        <p class="ob-bulk-note">点卡片或按住拖动框选；已添加的不会再被选中。只列出有直播间的关注；
+          批量添加只写主播资料，回放来源可以之后在「设置 → 主播管理」里补。</p>
+        <div class="ob-bulk-grid" id="ob-bulk-grid"></div>
+      </div>
+    </div>
   </div>
 
   <p class="ob-foot">
@@ -209,6 +227,7 @@ window.__BOOT_T0 = Date.now();
     <a class="tab" data-view="schedule" href="#/schedule">24 小时频道</a>
     <a class="tab" data-view="playlist" href="#/playlist">歌单</a>
     <a class="tab" data-view="multi" href="#/multi">监控室</a>
+    <a class="tab" data-view="recorder" href="#/recorder">录播姬</a>
     <a class="tab" data-view="dynamic" href="#/dynamic">动态</a>
     <a class="tab" data-view="weibo" href="#/weibo">微博</a>
     <a class="tab" data-view="dd" href="#/dd">DD</a>
@@ -225,6 +244,18 @@ window.__BOOT_T0 = Date.now();
          主站默认点亮，不允许全部熄灭。 -->
     <div class="station-lamps" id="station-lamps" role="group"
          title="点亮谁就看谁的内容，可同时点亮多位（混合播放）"></div>
+    <!-- B 站账号：未登录显示入口，已登录显示头像 + 名字（点开是账号状态窗口）。
+         播放器内那枚「登录」在录播姬/DD 这类把播放器缩到 1px 的板块点不到，所以这里必须有。 -->
+    <button class="ghost-btn tb-login" id="tb-login" type="button" title="登录 B 站">
+      <span class="tb-login-face" id="tb-login-face" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="5.5" width="18" height="13" rx="3"/>
+          <path d="M7.5 3l2.6 2.5M16.5 3l-2.6 2.5M8.6 10.6v1.6M15.4 10.6v1.6"/>
+        </svg>
+      </span>
+      <span class="tb-login-txt" id="tb-login-name">登录</span>
+    </button>
     <a class="ghost-btn" id="tb-space" href="#" target="_blank" rel="noopener">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16v12H4z"/><path d="M8 3l4 3 4-3"/></svg>
       <span class="gbtxt" id="gbtxt">主播B站空间</span>
@@ -245,6 +276,35 @@ window.__BOOT_T0 = Date.now();
     </label>
   </div>
 </header>
+
+  <!-- 全局登录弹窗（v1.9.16）。原来它只在播放器里（绝对定位、覆盖播放器），
+       录播姬 / DD 这类把播放器缩到 1px 的板块根本点不到 —— 改成 fixed 遮罩 + 居中卡片，
+       顶栏、设置页、播放器三处入口共用同一个弹窗与同一套扫码逻辑。 -->
+  <div class="login-panel" id="login-panel" hidden>
+    <div class="login-box" role="dialog" aria-modal="true" aria-label="B 站账号">
+      <div class="lp-head">
+        <b id="lp-title">登录 B 站</b>
+        <button class="lp-x" id="btn-login-close" type="button" aria-label="关闭">✕</button>
+      </div>
+      <div class="lp-anon" id="lp-anon">
+        <div class="login-qr" id="login-qr"></div>
+        <div class="login-status" id="login-status">正在获取二维码…</div>
+        <p class="lp-note">用 B 站手机 App 扫码，全程在本页完成，不会跳转</p>
+      </div>
+      <div class="lp-me" id="lp-me" hidden>
+        <div class="lp-face" id="lp-face"></div>
+        <div class="lp-me-id">
+          <b id="lp-name">—</b>
+          <span id="lp-uid">UID —</span>
+          <em id="lp-vip" hidden>大会员</em>
+        </div>
+        <div class="lp-btns">
+          <button class="btn small ghost" id="btn-logout" type="button">退出登录</button>
+          <button class="btn small ghost" id="btn-login-close-2" type="button">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
 <main class="wrap">
   <aside class="strip strip-left" id="strip-left">
@@ -768,6 +828,254 @@ window.__BOOT_T0 = Date.now();
       </table>
     </section>
 
+    <section class="view" id="view-recorder">
+      <div class="rc-head">
+        <div class="rc-head-txt">
+          <h1 class="title sm">录播姬</h1>
+          <p class="sub">给任意 B 站直播间开录制：<b>自动录制</b>开着时，启动就持续检测，
+            开播直接录、下播自动停。文件按 FLV 直存（不转码，CPU 几乎为 0）。</p>
+        </div>
+        <div class="rc-head-side">
+          <span class="rc-pill" id="rc-head-pill"><i></i><span id="rc-head-pill-txt">空闲</span></span>
+          <div class="rc-menu-wrap">
+            <button class="btn small ghost" id="rc-view-btn" type="button"
+                    aria-haspopup="menu" aria-expanded="false">视图 ▾</button>
+            <div class="rc-menu" id="rc-view-menu" role="menu" hidden>
+              <button type="button" role="menuitemradio" data-sort="none" aria-checked="true"><i></i>不排序</button>
+              <button type="button" role="menuitemradio" data-sort="room" aria-checked="false"><i></i>按房间号排序</button>
+              <button type="button" role="menuitemradio" data-sort="state" aria-checked="false"><i></i>按录制状态排序</button>
+              <div class="rc-menu-sep"></div>
+              <button type="button" role="menuitemcheckbox" data-toggle="notify" aria-checked="true"><i></i>开播时弹出系统通知</button>
+              <button type="button" role="menuitemcheckbox" data-toggle="showTitle" aria-checked="true"><i></i>显示直播间标题和分区</button>
+              <button type="button" role="menuitemcheckbox" data-toggle="showLog" aria-checked="true"><i></i>显示日志</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="rc-layout">
+        <!-- 左侧功能区：与录播页左栏同一套观感（小标题 + 12px 条目 + 8px 圆角） -->
+        <aside class="rc-side">
+          <div class="rc-side-h">功能</div>
+          <div class="rc-nav" id="rc-nav">
+            <button type="button" data-tab="rooms" class="on">房间<span class="rc-cnt" id="rc-nav-rooms">0</span></button>
+            <button type="button" data-tab="files">录制文件<span class="rc-cnt" id="rc-nav-files">0</span></button>
+            <button type="button" data-tab="log" id="rc-nav-log">运行日志</button>
+            <button type="button" data-tab="settings">设置</button>
+          </div>
+
+          <div class="rc-side-h">监控中</div>
+          <div class="rc-nav rc-nav-rooms" id="rc-nav-rooms-list"></div>
+
+          <div class="rc-auto">
+            <label class="rc-auto-row">
+              <input type="checkbox" id="rc-auto" data-rc-auto>
+              <span>自动录制</span>
+            </label>
+            <p class="rc-auto-note">启动应用后持续检测，开播即录，不用手动点开始。</p>
+          </div>
+        </aside>
+
+        <div class="rc-main">
+          <div class="rc-bar">
+            <span class="rc-meta" id="rc-meta"></span>
+            <span class="rc-actions">
+              <button class="btn small ghost" id="rc-all-start" type="button">全部开始</button>
+              <button class="btn small ghost" id="rc-all-stop" type="button">全部停止</button>
+              <button class="btn small ghost" id="rc-open-dir" type="button">打开输出目录</button>
+              <button class="btn small ghost" id="rc-refresh" type="button">刷新</button>
+            </span>
+          </div>
+
+          <div class="rc-pane" id="rc-pane-rooms">
+            <div class="rc-grid" id="rc-grid"></div>
+          </div>
+
+          <div class="rc-pane" id="rc-pane-files" hidden>
+            <div class="live-card">
+              <div class="live-card-h">录制文件<em class="rc-hsub" id="rc-files-stat"></em></div>
+              <div class="rc-files" id="rc-files"></div>
+            </div>
+          </div>
+
+          <div class="rc-pane" id="rc-pane-log" hidden>
+            <div class="live-card">
+              <div class="live-card-h">运行日志<em class="rc-hsub">最近 120 条</em></div>
+              <div class="rc-log" id="rc-log"></div>
+            </div>
+          </div>
+
+          <div class="rc-pane rc-set-pane" id="rc-pane-settings" hidden>
+            <div class="live-card">
+              <div class="live-card-h">输出</div>
+              <div class="rc-set-row">
+                <label class="rc-lab" for="rc-dir">录制输出目录</label>
+                <div class="rc-inline">
+                  <input class="rc-input" id="rc-dir" type="text" spellcheck="false" aria-label="录制输出目录">
+                  <button class="btn small ghost" id="rc-pick" type="button">选择…</button>
+                </div>
+              </div>
+              <div class="rc-set-row">
+                <label class="rc-lab" for="rc-qnids">录制画质ID
+                  <em>逗号分割，靠前优先；B 站按登录态决定实际档位</em></label>
+                <input class="rc-input" id="rc-qnids" type="text" spellcheck="false"
+                       placeholder="10000,400,250,150" aria-label="录制画质ID">
+              </div>
+              <p class="live-note">同时最多录 4 路；剩余空间低于 2 GB 时不再开新录制。
+                未登录 B 站通常只能拿到较低档位。</p>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">弹幕录制</div>
+              <label class="rc-opt">
+                <span class="rc-opt-t">保存弹幕
+                  <em>与录像同名的 .xml 侧车文件，播放器可直接读；未登录时跳过</em></span>
+                <input type="checkbox" data-rc-set="danmaku">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">录制模式</div>
+              <label class="rc-radio">
+                <input type="radio" name="rc-mode" value="standard" data-rc-set="mode">
+                <i></i><span><b>标准模式</b><em>按标准 FLV 写入，可选下面的修复选项</em></span>
+              </label>
+              <label class="rc-radio">
+                <input type="radio" name="rc-mode" value="raw" data-rc-set="mode">
+                <i></i><span><b>原始数据模式</b><em>不做任何修补，收到什么写什么</em></span>
+              </label>
+              <div class="rc-sub-h">标准模式录制修复设置</div>
+              <label class="rc-opt">
+                <span class="rc-opt-t">检测到可能缺少数据时间段
+                  <em>给 ffmpeg 加 genpts / discardcorrupt，尽量修补时间戳断档</em></span>
+                <input type="checkbox" data-rc-set="repairMissing">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+              <label class="rc-opt">
+                <span class="rc-opt-t">使用实验性花屏修复判定逻辑
+                  <em>忽略解码错误继续写，花屏段保留而不是整段中断</em></span>
+                <input type="checkbox" data-rc-set="repairGlitch">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">自动分段</div>
+              <label class="rc-radio">
+                <input type="radio" name="rc-seg" value="none" data-rc-set="segment">
+                <i></i><span><b>不要根据文件大小/视频时间自动分段</b></span>
+              </label>
+              <label class="rc-radio">
+                <input type="radio" name="rc-seg" value="size" data-rc-set="segment">
+                <i></i><span><b>根据文件大小自动分段</b>
+                  <input class="rc-input rc-num" id="rc-seg-size" type="number" min="16" max="10240"
+                         step="64" aria-label="分片大小 MB"> MB</span>
+              </label>
+              <label class="rc-radio">
+                <input type="radio" name="rc-seg" value="time" data-rc-set="segment">
+                <i></i><span><b>根据视频时间自动分段</b>
+                  <input class="rc-input rc-num" id="rc-seg-min" type="number" min="1" max="720"
+                         step="5" aria-label="分片时长 分钟"> 分钟</span>
+              </label>
+              <label class="rc-opt">
+                <span class="rc-opt-t">直播间更改标题后自动分段
+                  <em>检测到标题变化就另起一个文件（每 2 分钟查一次）</em></span>
+                <input type="checkbox" data-rc-set="segmentTitle">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">直播封面</div>
+              <label class="rc-opt">
+                <span class="rc-opt-t">录制时同时保存直播封面
+                  <em>与录像同名的 .cover.jpg</em></span>
+                <input type="checkbox" data-rc-set="cover">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">文件名</div>
+              <p class="live-note" style="margin-top:0">可用变量：
+                <code>{{ roomid }}</code> <code>{{ name }}</code> <code>{{ title }}</code>
+                <code>{{ uid }}</code> <code>{{ time }}</code> <code>{{ date }}</code>；
+                用 <code>/</code> 可以分子目录。</p>
+              <div class="rc-inline">
+                <input class="rc-input" id="rc-fname" type="text" spellcheck="false"
+                       aria-label="录制文件名格式">
+                <button class="btn small ghost" id="rc-fname-test" type="button">测试</button>
+              </div>
+              <label class="rc-opt rc-opt-tight">
+                <span class="rc-opt-t">默认<em>用内置格式：主播名/录制-房间号-时间</em></span>
+                <input type="checkbox" data-rc-set="filenameDefault">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+              <p class="live-note" id="rc-fname-prev">　</p>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">开播通知</div>
+              <label class="rc-opt">
+                <span class="rc-opt-t">直播间开播时弹出系统通知
+                  <em>需要「后台应用图标」开着才有气泡；否则只记运行日志</em></span>
+                <input type="checkbox" data-rc-set="notify">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">后台应用图标</div>
+              <label class="rc-opt">
+                <span class="rc-opt-t">在系统托盘显示应用图标
+                  <em>右键可打开控制台 / 录制目录 / 停止录制并退出</em></span>
+                <input type="checkbox" data-rc-set="tray">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+              <p class="live-note" id="rc-tray-note">关闭图标只是不显示它，<b>不会中断录制</b>。
+                页面关闭且没有录制任务时后台进程会自动退出；正在录制时会留在后台把文件写完再退。</p>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">录制条件</div>
+              <label class="rc-lab" for="rc-skip">跳过录制的直播标题正则匹配表达式
+                <em>每行一个；命中就不录这一场（可留空）</em></label>
+              <textarea class="rc-input rc-textarea" id="rc-skip" rows="3" spellcheck="false"
+                        aria-label="跳过录制的标题正则"></textarea>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">Webhook</div>
+              <div class="rc-set-row">
+                <label class="rc-lab" for="rc-wh2">Webhook v2
+                  <em>POST { Event, EventData }</em></label>
+                <input class="rc-input" id="rc-wh2" type="url" spellcheck="false"
+                       placeholder="https://example.com/hook" aria-label="Webhook v2">
+              </div>
+              <div class="rc-set-row">
+                <label class="rc-lab" for="rc-wh1">Webhook v1
+                  <em>POST { event, data }</em></label>
+                <input class="rc-input" id="rc-wh1" type="url" spellcheck="false"
+                       placeholder="https://example.com/hook" aria-label="Webhook v1">
+              </div>
+            </div>
+
+            <div class="live-card">
+              <div class="live-card-h">自动录制</div>
+              <label class="rc-opt">
+                <span class="rc-opt-t">启动后持续检测，开播即录
+                  <em>关闭后每个房间都要手动点「开始监控」</em></span>
+                <input type="checkbox" id="rc-auto3" data-rc-set="auto">
+                <i class="rc-sw" aria-hidden="true"></i>
+              </label>
+              <p class="live-note">改动会即时保存，不需要额外点保存。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section class="view" id="view-about">
       <h1 class="title sm">关于这个频道</h1>
       <div class="about-grid" id="about-body"></div>
@@ -777,12 +1085,35 @@ window.__BOOT_T0 = Date.now();
       <h1 class="title sm">设置</h1>
 
       <div class="live-card">
+        <div class="live-card-h">B 站账号</div>
+        <p class="live-note" id="set-acc-state">正在检查登录状态…</p>
+        <div class="qp-btns" style="margin-top:2px">
+          <button class="btn small primary" id="btn-acc-login" type="button">扫码登录 B 站</button>
+          <button class="btn small ghost" id="btn-acc-logout" type="button" hidden>退出登录</button>
+        </div>
+        <p class="live-note">登录后：回放最高 1080P、能发弹幕、录制能拿到更高画质。
+          凭据只保存在本机 <code>sessdata.txt</code>，只发给 B 站自己的接口。</p>
+      </div>
+
+      <div class="live-card" style="margin-top:18px">
         <div class="live-card-h">外观</div>
         <label class="seg-auto">
           <input type="checkbox" id="theme-light"> 浅色模式（不勾就是默认的黑红配色）
         </label>
         <p class="live-note">浅色下主色会压深一档，主播各自的板块色也按亮度压深，
           免得小字在白底上发飘。选择只记在本机浏览器里。</p>
+      </div>
+
+      <div class="live-card" style="margin-top:18px">
+        <div class="live-card-h">后台运行</div>
+        <label class="rc-opt rc-opt-tight">
+          <span class="rc-opt-t">后台应用图标
+            <em>在系统托盘显示图标；右键可打开控制台 / 录制目录 / 停止录制并退出</em></span>
+          <input type="checkbox" id="set-tray" data-tray-set>
+          <i class="rc-sw" aria-hidden="true"></i>
+        </label>
+        <p class="live-note" id="set-tray-note">关闭图标不会影响录制。网页全部关闭且没有录制任务时，
+          后台进程会自动退出；如果还有录制在写盘，进程会留在后台，把当前文件完整写完再安全退出。</p>
       </div>
 
       <div class="live-card" style="margin-top:18px">
@@ -810,7 +1141,8 @@ window.__BOOT_T0 = Date.now();
       <div class="live-card" style="margin-top:18px">
         <div class="live-card-h">分段与标注</div>
         <label class="seg-auto">本场分段
-          <button class="btn small ghost" id="btn-open-chapters" type="button">打开分段面板</button>
+          <button class="btn small ghost" id="btn-open-chapters" type="button"
+                  aria-expanded="false">打开分段面板</button>
         </label>
         <p class="live-note">列出当前这一场的分段，可跳转、可多选保存成 MP4。</p>
         <label class="seg-auto" style="margin-top:10px">片段标注
@@ -889,13 +1221,15 @@ window.__BOOT_T0 = Date.now();
       </div>
       <div class="live-card" style="margin-top:18px">
         <div class="live-card-h">主播管理</div>
-        <p class="live-note">填 B 站<b>空间号</b>（个人主页网址
-          <code>space.bilibili.com/&lt;数字&gt;</code> 里那串数字），点「检测」自动查出
+        <p class="live-note"><b>必须填 B 站 UID（空间号）</b>（个人主页网址
+          <code>space.bilibili.com/&lt;数字&gt;</code> 里那串数字，<b>不是直播间号</b>），
+          点「检测」自动查出
           主播名、直播间号与可选的回放来源。加进来的人会出现在顶栏那排色灯里 ——
           <b>不用再手工改 data/stations.json</b>。下面列表里<b>点一下主播名就能改显示名</b>，
           <b>点 ☆ 设为默认板块</b>（主站，顶栏品牌名跟着它走），<b>点 × 删除</b>。</p>
         <div class="live-send">
-          <input id="st-mid" inputmode="numeric" autocomplete="off" placeholder="主播 UID">
+          <input id="st-mid" inputmode="numeric" autocomplete="off"
+                 placeholder="B 站 UID（必填，不是直播间号）">
           <button class="btn small primary" id="st-probe" type="button">检测</button>
         </div>
         <label class="seg-auto" id="st-source-box" hidden>回放来源
@@ -1092,15 +1426,6 @@ window.__BOOT_T0 = Date.now();
         </div>
       </div>
 
-      <div class="login-panel" id="login-panel" hidden>
-        <div class="login-qr" id="login-qr"></div>
-        <div class="login-status" id="login-status">正在获取二维码…</div>
-        <div class="qp-btns">
-          <button class="btn small ghost" id="btn-logout" hidden>退出登录</button>
-          <button class="btn small ghost" id="btn-login-close">收起</button>
-        </div>
-      </div>
-
       <div class="offline-banner" id="offline-banner" hidden></div>
 
       <!-- 音乐播放器视图：切到「播放器模式」时盖住视频区（视频仍在后台放声音） -->
@@ -1190,7 +1515,9 @@ window.__BOOT_T0 = Date.now();
     </div>
 
     <div class="mark-panel" id="mark-panel" hidden>
-      <div class="qp-h">标注片段</div>
+      <div class="qp-h">标注片段
+        <button class="panel-x" id="mark-close" type="button" aria-label="关闭标注片段" title="关闭">✕</button>
+      </div>
       <p>分段由 <code>tools/auto_segments.py</code> 自动检测。这里<b>直接改</b>不准的地方：
         列表就是当前分P 的每一段 —— <b>起 / 止</b> 把边界设成当前播放位置，
         <b>拆</b> 在当前位置切成两段，<b>并</b> 与下一段合并，<b>删</b> 去掉多余段。
@@ -1208,7 +1535,9 @@ window.__BOOT_T0 = Date.now();
     </div>
 
     <div class="chapters-panel" id="chapters-panel" hidden>
-      <div class="qp-h">本场分段<span id="chapters-sub"></span></div>
+      <div class="qp-h">本场分段<span id="chapters-sub"></span>
+        <button class="panel-x" id="chapters-close" type="button" aria-label="关闭本场分段" title="关闭">✕</button>
+      </div>
       <div class="chap-legend">第 N 次 = 画面「已唱」第 N 次登记（不等于全场歌曲总数，
         漏读时会偏小）；约 N 首 = 按段长估算；悬停可看起止时间与来源。</div>
       <div class="chap-note" id="chap-note"></div>
@@ -1220,7 +1549,9 @@ window.__BOOT_T0 = Date.now();
         <button class="btn small ghost" id="clip-pick" type="button">选择文件夹</button>
         <button class="btn small primary" id="clip-save" type="button" disabled>保存为 MP4</button>
       </div>
+      <div class="clip-names" id="clip-names" hidden></div>
       <div class="clip-note" id="clip-note"></div>
+      <div class="clip-covers" id="clip-covers" hidden></div>
       <div class="chap-list" id="chap-list"></div>
     </div>
 

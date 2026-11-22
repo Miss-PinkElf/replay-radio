@@ -1609,7 +1609,7 @@
     };
   })();
 
-  var VIEWS = ['live', 'multi', 'broadcast', 'schedule', 'playlist',
+  var VIEWS = ['live', 'multi', 'recorder', 'broadcast', 'schedule', 'playlist',
                'dynamic', 'weibo', 'dd', 'about', 'settings'];
   var KEY_MUTED = 'xl_muted';
   var KEY_LOOP = 'xl_loop';         // 循环播放：off / one / list / random（见 state.loop）
@@ -1680,6 +1680,10 @@
     clipMode: false,                        // 分段列表进入「多选保存」模式
     clipSel: {},                            // 选中项：cid@start -> 1（跨重渲染保留）
     clipMeta: {},                           // 选中项对应的 bvid/cid/起止/标题
+    clipNames: {},                          // cid@start -> 用户给这一段起的名字（空 = 自动）
+    clipCovers: [],                         // 最近一批保存结果里的封面候选
+    clipCoverOrient: {},                    // 切片名 -> '16x9' | '3x4'（预览按哪种方向看）
+    clipCoverPick: {},                      // 切片名 -> 用户点选、尚未确认的候选序号
     clipBusy: false,                        // 正在保存，防重复提交
     qn: store.get('xl_qn', 80),             // 请求的清晰度；B 站会按登录态降级到最高可用
     qnDegraded: false,                      // 本次档位是不是「降级来的」（是的话不写进 xl_qn）
@@ -2958,6 +2962,14 @@
       }
       el.liveInfo.innerHTML = '<b>直播中</b> · ' + esc(d.title || '（无标题）')
         + (d.online ? ' · 人气 ' + fmtNum(d.online) : '');
+      /* 状态是直播中、但两条取流通道都没拿到地址：不要把画面留黑，
+         直接把原因写在横幅里，用户至少知道该去原直播间。 */
+      if (d.error && !(d.qualities || []).length) {
+        el.banner.hidden = false;
+        el.banner.innerHTML = '<div>' + esc('直播中，但取不到直播流：' + d.error) + '</div>';
+        chatStart();
+        return;
+      }
       el.banner.hidden = true;
       startLive(d.current_qn);
       chatStart();
@@ -3825,6 +3837,10 @@
       .then(function (d) {
         if (d.error) { stTip('<b>' + esc(d.error) + '</b>'); return; }
         stProbe = d.probe || null;
+        if (stProbe && stProbe.mid && stProbe.mid !== mid) {
+          mid = stProbe.mid;
+          input.value = mid;      // 直播间链接/房间号 → 换成真实 UID
+        }
         var srcs = (stProbe && stProbe.sources) || [];
         sel.innerHTML = '<option value="">自动（推荐：以后新系列会自己跟上）</option>'
           + srcs.map(function (s) {
@@ -3847,16 +3863,23 @@
         }
         if (colorBox) colorBox.hidden = false;
         if (stProbe && stProbe.face) stAccentAuto(stProbe.face);   // 自动按头像配色
-        stTip('查到 <b>' + esc((stProbe && stProbe.name) || ('UID ' + mid))
-          + '</b>' + ((stProbe && stProbe.room) ? '，房间号 ' + esc(stProbe.room) : '')
-          + '，确认无误就点保存。');
+        var who2 = esc((stProbe && stProbe.name) || ('UID ' + mid));
+        if (stProbe && stProbe.via_room) {
+          stTip('你填的是直播间 <b>' + esc(stProbe.via_room) + '</b>，已换算为 UID <b>'
+            + esc(mid) + '</b>（' + who2 + '），确认无误就点保存。');
+        } else {
+          stTip('查到 <b>' + who2 + '</b>'
+            + ((stProbe && stProbe.room) ? '，房间号 ' + esc(stProbe.room) : '')
+            + '，确认无误就点保存。');
+        }
       })
       .catch(function () { stTip('检测失败，请重试'); });
   }
 
   function saveStation() {
     var sel = document.getElementById('st-source');
-    var mid = (document.getElementById('st-mid').value || '').trim();
+    var mid = (stProbe && stProbe.mid)
+      ? stProbe.mid : (document.getElementById('st-mid').value || '').trim();
     if (!mid) { stTip('先填主播 UID'); return; }
     var body = { mid: mid };
     // 这位已经在列表里就带上它的 id：明确是「更新这一位」。
@@ -4347,6 +4370,7 @@
     /* DD 板块自己也要一个 class：它整块全宽、播放器缩到后台。
        ⚠️ body 上只有这种**特例 class**，没有通用的 view-<name>（踩过一次）。 */
     document.body.classList.toggle('view-dd', name === 'dd');
+    document.body.classList.toggle('view-recorder', name === 'recorder');
     document.querySelectorAll('.tab').forEach(function (t) {
       t.classList.toggle('active', t.getAttribute('data-view') === name);
     });
@@ -4388,6 +4412,12 @@
       var feed = document.getElementById('ddp-feed-list');
       if (feed && /dl-empty/.test(feed.innerHTML)) ddpQuery(1);
     }
+    /* 录播姬：进来才开始轮询。录制在后端跑，前端只是在看状态 —— 离开就停，
+       省得在别的板块每秒发两个请求。 */
+    if (name === 'recorder') rcEnter();
+    if (prev === 'recorder' && name !== 'recorder') rcLeave();
+    /* 设置页的「后台应用图标」要显示真实状态：进设置时拉一次录播姬设置 */
+    if (name === 'settings') rcTrayLoad();
     /* DD 板块的子页面：进入时按当前子标签拉数据（播放器缩在后台，播放不中断） */
     if (name === 'dd') ddSubLoad();
 
@@ -5439,21 +5469,106 @@
     if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
   }
 
+  /* 未登录时顶栏那颗头像位显示的图标（登出后要能还原回来，所以先存下来） */
+  var TB_LOGIN_ICON = '';
+  /* 最近一次 /api/status。打开登录弹窗时先按它渲染，避免「先闪一下二维码、
+     0.5 秒后才变成账号卡」—— 那一下不只是难看，按钮位置也会跳，真实点击会落空。 */
+  var lastStatus = null;
+
   function refreshStatus(force) {
     // 服务端缓存 30 秒；登录/登出之后必须拿新的，所以那两处传 true
     fetch('/api/status' + (force ? '?refresh=1' : ''))
-      .then(function (r) { return r.json(); }).then(function (d) {
-      el.loginLabel.textContent = d.logged ? (d.uname || '已登录') : '登录';
-      el.btnLogin.setAttribute('title', d.logged
+      .then(function (r) { return r.json(); }).then(applyLoginUI)
+      .catch(function () { /* 服务未启动时忽略 */ });
+  }
+
+  /* 登录态的**唯一渲染入口**：播放器按钮、顶栏、设置页、弹窗四处都在这里更新。
+     openLogin 拿到新鲜状态后也调它 —— 否则「弹窗里显示已登录、顶栏还写着登录」
+     （服务端状态缓存 30 秒，这个不一致是真实存在的）。 */
+  function applyLoginUI(d) {
+    if (!d) return;
+    lastStatus = d;
+    (function () {
+      var logged = !!d.logged;
+
+      // 播放器内那颗（录播页右上角）
+      el.loginLabel.textContent = logged ? (d.uname || '已登录') : '登录';
+      el.btnLogin.setAttribute('title', logged
         ? ('已登录：' + (d.uname || '') + (d.vip ? '（大会员）' : ''))
         : '扫码登录 B 站，解锁更高清晰度');
-      el.btnLogout.hidden = !d.logged;
-    }).catch(function () { /* 服务未启动时忽略 */ });
+      el.btnLogout.hidden = !logged;
+
+      /* 页面顶栏（v1.9.16）：录播姬 / DD 这类把播放器缩到 1px 的板块里，
+         播放器内那颗按钮点不到 —— 顶栏这个才是「任何页面都能登录」的入口。 */
+      if (el.tbLogin) {
+        el.tbLogin.classList.toggle('on', logged);
+        el.tbLogin.title = logged
+          ? ('已登录：' + (d.uname || '') + '（UID ' + (d.mid || '—') + '）'
+             + (d.vip ? ' · 大会员' : '') + ' · 点击查看账号')
+          : '登录 B 站（扫码）';
+        if (el.tbLoginName) {
+          el.tbLoginName.textContent = logged ? (d.uname || ('UID ' + (d.mid || ''))) : '登录';
+        }
+        if (el.tbLoginFace) {
+          el.tbLoginFace.innerHTML = logged
+            ? faceHtml(d.face, 'tb-face', d.uname || 'B')
+            : (TB_LOGIN_ICON || el.tbLoginFace.innerHTML);
+        }
+      }
+
+      // 设置页「B 站账号」卡
+      if (el.setAccState) {
+        el.setAccState.textContent = logged
+          ? ('已登录：' + (d.uname || '已登录') + '（UID ' + (d.mid || '—') + '）'
+             + (d.vip ? ' · 大会员' : ''))
+          : '未登录。点下面的按钮扫码，登录后回放最高 1080P、可发弹幕、录制画质更高。';
+      }
+      if (el.btnAccLogin) el.btnAccLogin.hidden = logged;
+      if (el.btnAccLogout) el.btnAccLogout.hidden = !logged;
+
+      // 弹窗正开着就同步切换（已登录 → 账号卡片；未登录 → 二维码）
+      if (el.loginPanel && !el.loginPanel.hidden) syncLoginView(d);
+    })();
+  }
+
+  /* 把「登录者是谁」画进弹窗：未登录只露出二维码区，已登录换成头像 + 昵称 + UID。 */
+  function syncLoginView(d) {
+    var logged = !!(d && d.logged);
+    if (el.lpAnon) el.lpAnon.hidden = logged;
+    if (el.lpMe) el.lpMe.hidden = !logged;
+    if (el.lpTitle) el.lpTitle.textContent = logged ? 'B 站账号' : '登录 B 站';
+    if (!logged) return;
+    if (el.lpFace) el.lpFace.innerHTML = faceHtml(d.face, 'lp-face-img', d.uname || 'B');
+    if (el.lpName) el.lpName.textContent = d.uname || '已登录';
+    if (el.lpUid) el.lpUid.textContent = 'UID ' + (d.mid || '—');
+    if (el.lpVip) el.lpVip.hidden = !d.vip;
   }
 
   // 全程在本页完成，不跳转外部页面
   function openLogin() {
     el.loginPanel.hidden = false;
+    /* 已登录时打开的是「账号状态窗口」，不是二维码 —— 否则每次想看自己是谁都要先等二维码。
+       先用 lastStatus 立刻渲染，再拿一次新鲜状态校准：
+         · 只等接口的话，弹窗会先按 HTML 默认（二维码位）显示，拿到结果再切换，
+           这一下布局跳动会让「关闭」按钮移位（实测真实点击落空）；
+         · 服务端缓存 30 秒，所以校准仍然要带 refresh=1。 */
+    if (lastStatus) {
+      applyLoginUI(lastStatus);
+    } else {
+      if (el.lpAnon) el.lpAnon.hidden = true;
+      if (el.lpMe) el.lpMe.hidden = true;
+    }
+    fetch('/api/status?refresh=1').then(function (r) { return r.json(); }).then(function (d) {
+      if (!d) return;
+      applyLoginUI(d);
+      if (!d.logged) loginStartQr();      // 确认未登录才去取二维码
+    }).catch(function () {
+      if (!lastStatus) loginStartQr();    // 连上次状态都没有才退回二维码
+    });
+  }
+
+  function loginStartQr() {
+    syncLoginView(null);                 // 未登录视图
     el.loginQr.innerHTML = '';
     el.loginStatus.textContent = '正在获取二维码…';
     el.btnLogout.hidden = true;
@@ -5509,7 +5624,7 @@
   function toggleChapters(on) {
     var next = typeof on === 'boolean' ? on : el.chaptersPanel.hidden;
     el.chaptersPanel.hidden = !next;
-    if (el.btnChapters) el.btnChapters.setAttribute('aria-expanded', String(next));
+    if (el.btnOpenChapters) el.btnOpenChapters.setAttribute('aria-expanded', String(next));
     if (next) {
       if (el.songcutPanel) el.songcutPanel.hidden = true;   // 两块面板占同一位置
       renderChapters();
@@ -5701,6 +5816,698 @@
     scStop();
   }
 
+  /* ---------------------------------------------------------- 录播姬（v1.9.15）
+     真正的录制在后端：一个调度线程按房间起 ffmpeg 直存 FLV（-c copy，不转码）。
+     前端只做四件事 —— 列房间、开关监控、看状态、改输出目录。
+     ⚠️ 状态每 2.5 秒刷一次，所以**房间卡片是增量更新**：整块 innerHTML 重建会
+        把用户正在输入的「添加房间」清空、把焦点弄丢（实测过）。
+     房间集合变化时才重建卡片结构，其余只改文本。 */
+
+  var rcState = {
+    data: null, files: null, timer: 0, tick: 0, tab: 'rooms', at: 0,
+    sort: localStorage.getItem('xl_rc_sort') || 'none',
+    showTitle: localStorage.getItem('xl_rc_title') !== '0',
+    showLog: localStorage.getItem('xl_rc_log') !== '0'
+  };
+
+  var RC_LABEL = { idle: '未监控', waiting: '等待开播', recording: '录制中', error: '出错' };
+  var RC_CLASS = { idle: '', waiting: 'wait', recording: 'rec', error: 'err' };
+
+  var RC_TABS = ['rooms', 'files', 'log', 'settings'];
+
+  function rcQ(id) { return document.getElementById(id); }
+
+  function rcSetTab(tab) {
+    if (tab === 'log' && !rcState.showLog) tab = 'rooms';
+    rcState.tab = RC_TABS.indexOf(tab) >= 0 ? tab : 'rooms';
+    RC_TABS.forEach(function (k) {
+      var p = rcQ('rc-pane-' + k);
+      if (p) p.hidden = (k !== rcState.tab);
+    });
+    if (el.rcNav) {
+      Array.prototype.forEach.call(el.rcNav.children, function (b) {
+        b.classList.toggle('on', b.getAttribute('data-tab') === rcState.tab);
+      });
+    }
+    if (rcState.tab === 'log' && el.rcLog) el.rcLog.scrollTop = el.rcLog.scrollHeight;
+    if (rcState.tab === 'settings') rcFnamePreview();
+  }
+
+  /* 左栏：功能计数 + 房间快捷列表 + 自动录制开关。
+     ⚠️ 与房间卡片同理，结构只在房间集合变化时重建 —— 房间列表也带 data-sig。 */
+  function rcPaintNav(d) {
+    var rooms = d.rooms || [];
+    if (el.rcNavRooms) el.rcNavRooms.textContent = String(rooms.length);
+    if (el.rcNavFiles) {
+      el.rcNavFiles.textContent = String((rcState.files && rcState.files.total) || 0);
+    }
+    if (el.rcNavRoomsList) {
+      var sig = rooms.map(function (r) { return r.room; }).join(',');
+      if (el.rcNavRoomsList.getAttribute('data-sig') !== sig) {
+        el.rcNavRoomsList.setAttribute('data-sig', sig);
+        el.rcNavRoomsList.innerHTML = rooms.length ? rooms.map(function (r) {
+          return '<button type="button" data-goto="' + esc(r.room) + '">'
+            + '<i class="dot" data-role="dot"></i>'
+            + '<span class="nm" title="' + esc(r.name) + '">' + esc(r.name) + '</span></button>';
+        }).join('') : '<button type="button" disabled>还没有房间</button>';
+      }
+      rooms.forEach(function (r) {
+        var b = el.rcNavRoomsList.querySelector('[data-goto="' + r.room + '"]');
+        if (!b) return;
+        var dot = b.querySelector('[data-role="dot"]');
+        if (dot) dot.className = 'dot ' + (RC_CLASS[r.state] || '');
+        b.title = r.name + ' · ' + (RC_LABEL[r.state] || r.state);
+      });
+    }
+    var auto = !!(d.settings && d.settings.auto);
+    [el.rcAuto, el.rcAuto2, rcQ('rc-auto3')].forEach(function (cb) {
+      if (cb && cb.checked !== auto) cb.checked = auto;
+    });
+  }
+
+  function rcSize(n) {
+    n = +n || 0;
+    if (n >= 1024 * 1024 * 1024) return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+    if (n >= 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+    return Math.round(n / 1024) + ' KB';
+  }
+
+  function rcStamp(ts) {
+    var d = new Date((+ts || 0) * 1000);
+    if (!+ts) return '';
+    function p2(v) { return (v < 10 ? '0' : '') + v; }
+    return (d.getMonth() + 1) + '-' + p2(d.getDate()) + ' ' + p2(d.getHours()) + ':' + p2(d.getMinutes());
+  }
+
+  /* 录制时长要**连续**走：状态 2.5 秒才拉一次，只靠服务端的 since/now 会一跳一跳，
+     所以本地按「上次拉取时刻 + 已经过去的秒数」补差。 */
+  function rcElapsed(r) {
+    if (!r || !r.since) return 0;
+    var base = (rcState.data && rcState.data.now) || 0;
+    var drift = rcState.at ? (Date.now() - rcState.at) / 1000 : 0;
+    return Math.max(0, base + drift - r.since);
+  }
+
+  function rcSorted(rooms) {
+    var arr = (rooms || []).slice();
+    if (rcState.sort === 'room') {
+      arr.sort(function (a, b) { return (+a.room || 0) - (+b.room || 0); });
+    } else if (rcState.sort === 'state') {
+      var rank = { recording: 0, waiting: 1, error: 2, idle: 3 };
+      arr.sort(function (a, b) {
+        var d = (rank[a.state] || 9) - (rank[b.state] || 9);
+        return d || ((+a.room || 0) - (+b.room || 0));
+      });
+    }
+    return arr;
+  }
+
+  function rcRoomHtml(r) {
+    return '<div class="rc-room" data-room="' + esc(r.room) + '">'
+      + '<div class="rc-room-top">'
+      + faceHtml(r.face, 'rc-face', r.name)
+      + '<div class="rc-room-id"><b class="rc-name" title="' + esc(r.name) + '">'
+      + esc(r.name) + '</b><span class="rc-room-no"><span>房间 ' + esc(r.room) + '</span>'
+      + (r.uid ? '<span>UID ' + esc(r.uid) + '</span>' : '') + '</span></div>'
+      + '<span class="rc-st" data-role="st"><i></i><span data-role="sttxt">未监控</span></span>'
+      + '</div>'
+      + '<p class="rc-title" data-role="title"></p>'
+      + '<div class="rc-meta-row"><span class="rc-area" data-role="area"></span>'
+      + '<span class="rc-size" data-role="size"></span></div>'
+      + '<p class="rc-err" data-role="err" hidden></p>'
+      + '<div class="rc-btns">'
+      + '<button class="btn small primary" data-act="toggle" type="button" title="开始/停止监控">开始</button>'
+      + '<button class="btn small ghost" data-act="live" type="button" title="在新标签页打开原直播间">直播间</button>'
+      + '<button class="btn small ghost" data-act="dir" type="button" title="打开这一路的输出目录">目录</button>'
+      + '<button class="btn small ghost" data-act="del" type="button" title="从列表里删除这个房间">删除</button>'
+      + '</div></div>';
+  }
+
+  function rcAddHtml() {
+    return '<div class="rc-add">'
+      + '<b>＋ 添加房间</b>'
+      + '<div class="rc-add-row">'
+      + '<input class="rc-input" id="rc-new" type="text" spellcheck="false"'
+      + ' placeholder="房间号或房间链接" aria-label="房间号或直播间链接" autocomplete="off">'
+      + '<button class="btn small primary" id="rc-new-ok" type="button">确定</button>'
+      + '</div>'
+      + '<span class="rc-ids">也可以直接填主播 UID</span></div>';
+  }
+
+  function rcPaintRooms(d) {
+    var box = el.rcGrid;
+    if (!box) return;
+    var rooms = rcSorted(d.rooms || []);
+    var sig = rooms.map(function (r) { return r.room; }).join(',') + '|' + rcState.sort;
+    if (box.getAttribute('data-sig') !== sig) {
+      box.setAttribute('data-sig', sig);
+      box.innerHTML = rooms.map(rcRoomHtml).join('') + rcAddHtml();
+      bindFaceFallback(box);
+    }
+    rooms.forEach(function (r) {
+      var card = box.querySelector('.rc-room[data-room="' + r.room + '"]');
+      if (!card) return;
+      var st = r.state || 'idle';
+      var sb = card.querySelector('[data-role="st"]');
+      var txt = RC_LABEL[st] || st;
+      if (st === 'recording') txt = '录制中 ' + fmtClock(rcElapsed(r));
+      if (sb) {
+        sb.className = 'rc-st ' + (RC_CLASS[st] || '');
+        var tt = sb.querySelector('[data-role="sttxt"]');
+        if (tt) tt.textContent = txt;
+        sb.title = r.error || txt;
+      }
+      var tl = card.querySelector('[data-role="title"]');
+      if (tl) {
+        tl.textContent = r.title || (r.enabled ? '等待开播…' : '还没开始监控');
+        tl.title = r.title || '';
+      }
+      var ar = card.querySelector('[data-role="area"]');
+      if (ar) {
+        ar.textContent = r.area || '';
+        ar.hidden = !r.area;
+      }
+      var sz = card.querySelector('[data-role="size"]');
+      if (sz) {
+        var bits = [];
+        if (st === 'recording' && r.bytes) bits.push(rcSize(r.bytes));
+        if (r.segNo > 1) bits.push('第 ' + r.segNo + ' 段');
+        if (r.hasXml) bits.push('弹幕');
+        if (r.hasCover) bits.push('封面');
+        sz.textContent = bits.join(' · ');
+      }
+      var er = card.querySelector('[data-role="err"]');
+      if (er) {
+        er.hidden = !r.error;
+        er.textContent = r.error || '';
+      }
+      var btn = card.querySelector('[data-act="toggle"]');
+      if (btn) {
+        btn.textContent = r.enabled ? '停止' : '开始';
+        btn.className = 'btn small ' + (r.enabled ? 'ghost' : 'primary');
+      }
+    });
+  }
+
+  function rcPaintMeta(d) {
+    var rooms = d.rooms || [];
+    var rec = rooms.filter(function (r) { return r.state === 'recording'; }).length;
+    var wait = rooms.filter(function (r) { return r.enabled && r.state !== 'recording'; }).length;
+    var free = (d.disk && d.disk.free) || 0;
+    if (el.rcMeta) {
+      el.rcMeta.innerHTML = '<span>ffmpeg '
+        + (d.ffmpeg ? '<b>已就绪</b>' : '<b class="warn">未找到</b>')
+        + '</span><span>剩余 <b>' + rcSize(free) + '</b></span>'
+        + '<span><b>' + rec + '</b> / ' + d.maxLive + ' 路录制中</span>'
+        + '<span>' + rooms.length + ' 个房间</span>'
+        + (d.busy ? '<span class="warn">后台写盘中，关页面不会中断</span>' : '');
+    }
+    var pill = rcQ('rc-head-pill');
+    var ptxt = rcQ('rc-head-pill-txt');
+    if (pill && ptxt) {
+      pill.className = 'rc-pill ' + (rec ? 'rec' : (wait ? 'wait' : ''));
+      ptxt.textContent = rec ? ('录制中 ' + rec + ' 路')
+        : (wait ? ('等待开播 ' + wait + ' 个') : '空闲');
+    }
+  }
+
+  function rcPaintFiles(d, f) {
+    if (!el.rcFiles) return;
+    var list = (f && f.files) || [];
+    if (el.rcFilesStat) {
+      var total = 0;
+      list.forEach(function (x) { total += (+x.size || 0); });
+      el.rcFilesStat.textContent = list.length
+        ? ('共 ' + list.length + ' 个 · ' + rcSize(total)) : '';
+    }
+    if (!list.length) {
+      el.rcFiles.innerHTML = '<p class="live-note" style="margin:0">还没有录制文件。'
+        + '点房间卡片上的「开始监控」，开播后会自动录到输出目录。</p>';
+      return;
+    }
+    el.rcFiles.innerHTML = list.slice(0, 120).map(function (x) {
+      return '<div class="rc-file"><span class="nm" title="' + esc(x.file) + '">'
+        + esc(x.file) + '</span><span class="sz">' + rcSize(x.size) + '</span>'
+        + '<span class="tm">' + esc(rcStamp(x.mtime)) + '</span>'
+        + '<span class="op"><button class="rc-mini" type="button" data-reveal="'
+        + esc(x.path || '') + '">定位</button></span></div>';
+    }).join('');
+  }
+
+  function rcPaintLog(d) {
+    if (!el.rcLog) return;
+    var rows = (d.log || []).slice(-120);
+    if (!rows.length) {
+      el.rcLog.innerHTML = '<div><span class="t">—</span><span class="msg">还没有日志</span></div>';
+      return;
+    }
+    el.rcLog.innerHTML = rows.map(function (x) {
+      var lv = x.lv === 'err' ? 'err' : (x.lv === 'warn' ? 'warn' : (x.lv === 'ok' ? 'ok' : ''));
+      return '<div><span class="t">' + esc(x.t) + '</span>'
+        + '<span class="lv lv-' + lv + '">' + esc(lv || 'info') + '</span>'
+        + '<span class="msg">' + (x.name ? '[' + esc(x.name) + '] ' : '') + esc(x.msg) + '</span></div>';
+    }).join('');
+    el.rcLog.scrollTop = el.rcLog.scrollHeight;      // 跟到最新一条
+  }
+
+  /* 设置面板：所有 [data-rc-set] 控件都由这里回填。
+     ⚠️ 用户正在输入的框不要抢（document.activeElement 判定）。 */
+  function rcPaintSettings(d) {
+    var s = (d && d.settings) || {};
+    Array.prototype.forEach.call(document.querySelectorAll('[data-rc-set]'), function (inp) {
+      var k = inp.getAttribute('data-rc-set');
+      if (inp.type === 'radio') {
+        inp.checked = String(s[k] || '') === inp.value;
+      } else if (inp.type === 'checkbox') {
+        inp.checked = !!s[k];
+      }
+    });
+    function val(id, v) {
+      var e = rcQ(id);
+      if (e && document.activeElement !== e) e.value = v;
+    }
+    val('rc-dir', s.dir || '');
+    val('rc-qnids', s.qnIds || '');
+    val('rc-seg-size', s.segmentSize || 1024);
+    val('rc-seg-min', s.segmentMinutes || 60);
+    val('rc-skip', s.skipTitle || '');
+    val('rc-wh2', s.webhookV2 || '');
+    val('rc-wh1', s.webhookV1 || '');
+    var fname = rcQ('rc-fname');
+    if (fname && document.activeElement !== fname) {
+      fname.value = s.filenameDefault ? (d.template || '') : (s.filename || '');
+    }
+    rcSyncTraySwitches(s);
+  }
+
+  /* 两个开关（录播姬设置 / 全局设置）都指向同一个设置项。
+     ⚠️ 只能按**刚保存的值**回填：这里如果去读 rcState.data，全局设置页上那份
+     数据是进入页面时拉的快照（rcLoad 在非录播姬页会直接 return，不会刷新），
+     点一下就会被旧值立刻翻回原样 —— 表现就是「开关点了没反应」。 */
+  function rcApplyTraySwitch(on) {
+    on = !!on;
+    var a = document.querySelector('[data-rc-set="tray"]');
+    if (a && a.checked !== on) a.checked = on;
+    var b = rcQ('set-tray');
+    if (b && b.checked !== on) b.checked = on;
+    var note = rcQ('set-tray-note');
+    if (note) {
+      note.textContent = on
+        ? '图标已显示在系统托盘。关闭图标不会影响录制；网页全部关闭且没有录制任务时后台进程会自动退出。'
+        : '图标已隐藏（不影响录制）。网页全部关闭且没有录制任务时后台进程会自动退出；'
+          + '如果还有录制在写盘，进程会留在后台，把当前文件完整写完再安全退出。';
+    }
+    var tn = rcQ('rc-tray-note');
+    var tray = (rcState.data && rcState.data.tray) || {};
+    if (tn && tray.failed) {
+      tn.textContent = '这台系统没能显示托盘图标：' + tray.failed + '（不影响录制）';
+    }
+  }
+
+  function rcSyncTraySwitches(s) {
+    s = s || ((rcState.data && rcState.data.settings) || {});
+    rcApplyTraySwitch(!!s.tray);
+  }
+
+  function rcApplyUI() {
+    var main = document.querySelector('.rc-main');
+    if (main) main.classList.toggle('rc-hide-meta', !rcState.showTitle);
+    if (el.rcNavLog) el.rcNavLog.hidden = !rcState.showLog;
+    if (!rcState.showLog && rcState.tab === 'log') rcSetTab('rooms');
+    rcSyncMenu();
+  }
+
+  function rcSyncMenu() {
+    var menu = rcQ('rc-view-menu');
+    if (!menu) return;
+    Array.prototype.forEach.call(menu.querySelectorAll('[data-sort]'), function (b) {
+      b.setAttribute('aria-checked',
+        b.getAttribute('data-sort') === rcState.sort ? 'true' : 'false');
+    });
+    var s = (rcState.data && rcState.data.settings) || {};
+    Array.prototype.forEach.call(menu.querySelectorAll('[data-toggle]'), function (b) {
+      var k = b.getAttribute('data-toggle');
+      var on = k === 'notify' ? !!s.notify
+        : (k === 'showTitle' ? rcState.showTitle : rcState.showLog);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    });
+  }
+
+  function rcPaint() {
+    var d = rcState.data;
+    if (!d) return;
+    rcPaintRooms(d);
+    rcPaintNav(d);
+    rcPaintMeta(d);
+    rcPaintFiles(d, rcState.files);
+    rcPaintLog(d);
+    rcPaintSettings(d);
+    rcApplyUI();
+  }
+
+  function rcLoad() {
+    if (state.view !== 'recorder') return;
+    fetch('/api/recorder/state').then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || d.error) return;
+        rcState.data = d;
+        rcState.at = Date.now();
+        return fetch('/api/recorder/files').then(function (r) { return r.json(); })
+          .then(function (f) { rcState.files = f || null; });
+      })
+      .then(function () { rcPaint(); })
+      .catch(function () { /* 下一轮会重试 */ });
+  }
+
+  function rcTickLocal() {
+    if (state.view !== 'recorder' || !rcState.data) return;
+    Array.prototype.forEach.call(document.querySelectorAll('#rc-grid .rc-room'), function (card) {
+      var room = card.getAttribute('data-room');
+      var r = null;
+      (rcState.data.rooms || []).forEach(function (x) { if (x.room === room) r = x; });
+      if (!r || r.state !== 'recording') return;
+      var tt = card.querySelector('[data-role="sttxt"]');
+      if (tt) tt.textContent = '录制中 ' + fmtClock(rcElapsed(r));
+    });
+  }
+
+  function rcPost(url, body) {
+    return fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {})
+    }).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+    }).then(function (x) {
+      if (!x.ok) {
+        pvToast('录播姬：' + ((x.d && x.d.error) || '操作失败'));
+        return false;
+      }
+      rcLoad();
+      return true;
+    }).catch(function (e) {
+      pvToast('录播姬：' + e);
+      return false;
+    });
+  }
+
+  function rcSaveSettings(body, key) {
+    return rcPost('/api/recorder/settings', body).then(function (ok) {
+      if (!ok) return false;
+      if (key === 'tray') {
+        // 先把「保存后的值」写进本地快照再回填，避免被旧快照翻回去
+        if (rcState.data && rcState.data.settings) {
+          rcState.data.settings.tray = !!body.tray;
+        }
+        rcApplyTraySwitch(!!body.tray);
+        setTimeout(rcTrayLoad, 320);       // 再向后台确认一次（含 tray.failed）
+      }
+      pvToast('设置已保存');
+      if (key === 'filenameDefault' || key === 'filename') rcFnamePreview(true);
+      return true;
+    });
+  }
+
+  function rcAdd() {
+    var inp = rcQ('rc-new');
+    var v = inp ? inp.value.trim() : '';
+    if (!v) { if (inp) inp.focus(); return; }
+    rcPost('/api/recorder/add', { input: v }).then(function (ok) {
+      if (ok && inp) inp.value = '';
+    });
+  }
+
+  function rcToggle(room, enabled) {
+    return rcPost(enabled ? '/api/recorder/stop' : '/api/recorder/start', { room: room });
+  }
+
+  var rcNameTimer = 0;
+  function rcFnamePreview(force) {
+    var inp = rcQ('rc-fname');
+    var cb = document.querySelector('[data-rc-set="filenameDefault"]');
+    var prev = rcQ('rc-fname-prev');
+    if (!inp || !cb) return;
+    if (rcNameTimer) clearTimeout(rcNameTimer);
+    rcNameTimer = setTimeout(function () {
+      fetch('/api/recorder/name_test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ template: inp.value, filenameDefault: cb.checked })
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        if (prev) prev.textContent = d && d.full ? ('示例：' + d.full) : '　';
+      }).catch(function () { /* 预览失败不影响保存 */ });
+    }, force ? 0 : 350);
+  }
+
+  function rcTrayLoad() {
+    fetch('/api/recorder/state').then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d || d.error) return;
+        rcState.data = d;
+        rcState.at = Date.now();
+        rcSyncTraySwitches(d.settings);
+      }).catch(function () {});
+  }
+
+  function rcEnter() {
+    rcSetTab(rcState.tab);
+    rcLoad();
+    if (rcState.timer) clearInterval(rcState.timer);
+    if (rcState.tick) clearInterval(rcState.tick);
+    rcState.timer = setInterval(rcLoad, 2500);
+    rcState.tick = setInterval(rcTickLocal, 1000);
+  }
+
+  function rcLeave() {
+    if (rcState.timer) { clearInterval(rcState.timer); rcState.timer = 0; }
+    if (rcState.tick) { clearInterval(rcState.tick); rcState.tick = 0; }
+  }
+
+  function rcMenuOpen(open) {
+    var m = rcQ('rc-view-menu');
+    var b = rcQ('rc-view-btn');
+    if (!m || !b) return;
+    m.hidden = !open;
+    b.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+
+  function bindRecorder() {
+    if (el.rcGrid) {
+      el.rcGrid.addEventListener('click', function (e) {
+        var b = e.target.closest ? e.target.closest('button') : null;
+        if (!b) return;
+        if (b.id === 'rc-new-ok') { rcAdd(); return; }
+        var card = b.closest('.rc-room');
+        if (!card) return;
+        var room = card.getAttribute('data-room');
+        var act = b.getAttribute('data-act');
+        if (act === 'toggle') {
+          rcToggle(room, !!(b.textContent.indexOf('停止') >= 0));
+        } else if (act === 'live') {
+          window.open('https://live.bilibili.com/' + encodeURIComponent(room),
+                      '_blank', 'noopener');
+        } else if (act === 'dir') {
+          rcPost('/api/recorder/open', { room: room });
+        } else if (act === 'del') {
+          if (window.confirm('删除这个房间？已经录好的文件不会被删除。')) {
+            rcPost('/api/recorder/remove', { room: room });
+          }
+        }
+      });
+      el.rcGrid.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && e.target && e.target.id === 'rc-new') {
+          e.preventDefault();
+          rcAdd();
+        }
+      });
+    }
+    if (el.rcNav) el.rcNav.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-tab]') : null;
+      if (b) rcSetTab(b.getAttribute('data-tab'));
+    });
+    if (el.rcNavRoomsList) el.rcNavRoomsList.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('button[data-goto]') : null;
+      if (!b) return;
+      rcSetTab('rooms');
+      var card = el.rcGrid && el.rcGrid.querySelector(
+        '.rc-room[data-room="' + b.getAttribute('data-goto') + '"]');
+      if (!card) return;
+      card.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      card.classList.add('flash');
+      setTimeout(function () { card.classList.remove('flash'); }, 1200);
+    });
+    [el.rcAuto, el.rcAuto2, rcQ('rc-auto3')].forEach(function (cb) {
+      if (!cb) return;
+      cb.addEventListener('change', function () {
+        rcSaveSettings({ auto: cb.checked }, 'auto');
+      });
+    });
+
+    /* 视图菜单 */
+    var vbtn = rcQ('rc-view-btn');
+    var vmenu = rcQ('rc-view-menu');
+    if (vbtn) {
+      vbtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        rcMenuOpen(vmenu ? vmenu.hidden : false);
+      });
+    }
+    if (vmenu) {
+      vmenu.addEventListener('click', function (e) {
+        var b = e.target.closest ? e.target.closest('button') : null;
+        if (!b) return;
+        var sort = b.getAttribute('data-sort');
+        if (sort) {
+          rcState.sort = sort;
+          localStorage.setItem('xl_rc_sort', sort);
+          if (rcState.data) rcPaintRooms(rcState.data);
+          rcSyncMenu();
+          rcMenuOpen(false);
+          return;
+        }
+        var k = b.getAttribute('data-toggle');
+        if (!k) return;
+        var on = b.getAttribute('aria-checked') !== 'true';
+        if (k === 'notify') {
+          rcSaveSettings({ notify: on }, 'notify');
+        } else if (k === 'showTitle') {
+          rcState.showTitle = on;
+          localStorage.setItem('xl_rc_title', on ? '1' : '0');
+          rcApplyUI();
+        } else if (k === 'showLog') {
+          rcState.showLog = on;
+          localStorage.setItem('xl_rc_log', on ? '1' : '0');
+          rcApplyUI();
+        }
+        b.setAttribute('aria-checked', on ? 'true' : 'false');
+        rcMenuOpen(false);
+      });
+    }
+    document.addEventListener('click', function (e) {
+      if (!vmenu || vmenu.hidden) return;
+      if (e.target === vbtn || (vbtn && vbtn.contains(e.target))) return;
+      if (vmenu.contains(e.target)) return;
+      rcMenuOpen(false);
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') rcMenuOpen(false);
+    });
+
+    /* 设置面板：开关/单选框统一走 change 委托 */
+    var pane = rcQ('rc-pane-settings');
+    if (pane) {
+      pane.addEventListener('change', function (e) {
+        var inp = e.target;
+        var key = inp && inp.getAttribute ? inp.getAttribute('data-rc-set') : '';
+        if (!key) return;
+        var body = {};
+        if (inp.type === 'radio') {
+          if (!inp.checked) return;
+          body[key] = inp.value;
+        } else if (inp.type === 'checkbox') {
+          body[key] = inp.checked;
+        } else {
+          body[key] = inp.value;
+        }
+        rcSaveSettings(body, key);
+      });
+    }
+    if (el.rcDir) {
+      el.rcDir.addEventListener('change', function () {
+        rcSaveSettings({ dir: el.rcDir.value.trim() }, 'dir');
+      });
+    }
+    var qnids = rcQ('rc-qnids');
+    if (qnids) {
+      qnids.addEventListener('change', function () {
+        rcSaveSettings({ qnIds: qnids.value.trim() }, 'qnIds');
+      });
+    }
+    var segSize = rcQ('rc-seg-size');
+    if (segSize) {
+      segSize.addEventListener('change', function () {
+        rcSaveSettings({ segmentSize: parseInt(segSize.value, 10) || 1024 }, 'segmentSize');
+      });
+    }
+    var segMin = rcQ('rc-seg-min');
+    if (segMin) {
+      segMin.addEventListener('change', function () {
+        rcSaveSettings({ segmentMinutes: parseInt(segMin.value, 10) || 60 }, 'segmentMinutes');
+      });
+    }
+    var fname = rcQ('rc-fname');
+    if (fname) {
+      fname.addEventListener('input', function () {
+        // 用户开始改模板 → 自动取消「默认」，否则改了也不生效（会让人以为坏了）
+        var cb = document.querySelector('[data-rc-set="filenameDefault"]');
+        if (cb && cb.checked) cb.checked = false;
+        rcFnamePreview();
+      });
+      fname.addEventListener('change', function () {
+        var cb = document.querySelector('[data-rc-set="filenameDefault"]');
+        var body = { filename: fname.value.trim() };
+        if (cb) body.filenameDefault = !!cb.checked;
+        rcSaveSettings(body, 'filename');
+      });
+    }
+    var fbtn = rcQ('rc-fname-test');
+    if (fbtn) fbtn.addEventListener('click', function () { rcFnamePreview(true); });
+    var skip = rcQ('rc-skip');
+    if (skip) {
+      skip.addEventListener('change', function () {
+        rcSaveSettings({ skipTitle: skip.value }, 'skipTitle');
+      });
+    }
+    ['rc-wh2', 'rc-wh1'].forEach(function (id) {
+      var e2 = rcQ(id);
+      if (!e2) return;
+      e2.addEventListener('change', function () {
+        var body = {};
+        body[id === 'rc-wh2' ? 'webhookV2' : 'webhookV1'] = e2.value.trim();
+        rcSaveSettings(body, id);
+      });
+    });
+
+    /* 设置页里的「后台应用图标」与录播姬设置里的开关共用同一个设置项 */
+    Array.prototype.forEach.call(document.querySelectorAll('[data-tray-set]'), function (cb) {
+      cb.addEventListener('change', function () {
+        rcSaveSettings({ tray: cb.checked }, 'tray');
+      });
+    });
+
+    if (el.rcRefresh) el.rcRefresh.addEventListener('click', rcLoad);
+    if (el.rcOpenDir) el.rcOpenDir.addEventListener('click', function () {
+      rcPost('/api/recorder/open', {});
+    });
+    if (el.rcAllStart) el.rcAllStart.addEventListener('click', function () {
+      var rooms = (rcState.data && rcState.data.rooms) || [];
+      rooms.forEach(function (r) { if (!r.enabled) rcPost('/api/recorder/start', { room: r.room }); });
+    });
+    if (el.rcAllStop) el.rcAllStop.addEventListener('click', function () {
+      var rooms = (rcState.data && rcState.data.rooms) || [];
+      rooms.forEach(function (r) { if (r.enabled) rcPost('/api/recorder/stop', { room: r.room }); });
+    });
+    if (el.rcFiles) {
+      el.rcFiles.addEventListener('click', function (e) {
+        var b = e.target.closest ? e.target.closest('[data-reveal]') : null;
+        if (!b) return;
+        rcPost('/api/recorder/reveal', { path: b.getAttribute('data-reveal') });
+      });
+    }
+    if (el.rcPick) el.rcPick.addEventListener('click', function () {
+      fetch('/api/recorder/pick', { method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: '{}' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.dir) {
+            if (el.rcDir) el.rcDir.value = d.dir;
+            rcSaveSettings({ dir: d.dir }, 'dir');
+          }
+        }).catch(function (e) { pvToast('选目录失败：' + e); });
+    });
+  }
+
   /* ---------------------------------------------------------- 片段保存
      在分段面板里多选，逐段剪成 mp4 存到本机。选中态按 cid@start 记，
      重画/切段都不会掉；真正保存的条目以本轮渲染出来的 clipMeta 为准。 */
@@ -5715,6 +6522,161 @@
       if (state.clipSel[k] && state.clipMeta[k]) n++;
     }
     return n;
+  }
+
+  /* 选中的分段按时间排序 —— 命名列表、保存顺序、封面卡片都用同一份。 */
+  function clipSelectedItems() {
+    var items = [];
+    Object.keys(state.clipSel).forEach(function (k) {
+      var m = state.clipMeta[k];
+      if (!m || !state.clipSel[k]) return;
+      items.push({ key: k, bvid: m.bvid, cid: m.cid, start: m.start, end: m.end,
+                   title: m.title, n: m.n });
+    });
+    items.sort(function (a, b) {
+      return (a.start - b.start) || (String(a.cid) < String(b.cid) ? -1 : 1);
+    });
+    return items;
+  }
+
+  function clipFmt(sec) {
+    sec = Math.max(0, Math.floor(+sec || 0));
+    function p2(v) { return (v < 10 ? '0' : '') + v; }
+    return p2(Math.floor(sec / 3600)) + '-' + p2(Math.floor(sec % 3600 / 60))
+      + '-' + p2(sec % 60);
+  }
+
+  /* 与后端 _clip_name 同形（不含扩展名），只用来做输入框占位提示 */
+  function clipAutoName(m) {
+    var t = String(m.title || '片段').replace(/[\\/:*?"<>|\s]+/g, '_')
+      .replace(/^[._ ]+|[._ ]+$/g, '').slice(0, 48);
+    if (!t) t = '片段';
+    var n = (+m.n || 1);
+    return t + '_第' + (n < 10 ? '0' + n : n) + '段_'
+      + clipFmt(m.start) + '~' + clipFmt(m.end);
+  }
+
+  /* 逐段命名：选中项变了才重建结构，否则只回填值（不打断正在输入的人）。 */
+  function renderClipNames() {
+    var box = document.getElementById('clip-names');
+    if (!box) return;
+    var items = clipSelectedItems();
+    if (!state.clipMode || !items.length) {
+      box.hidden = true;
+      box.innerHTML = '';
+      box.removeAttribute('data-sig');
+      return;
+    }
+    box.hidden = false;
+    var sig = items.map(function (x) { return x.key; }).join(',');
+    if (box.getAttribute('data-sig') !== sig) {
+      box.setAttribute('data-sig', sig);
+      box.innerHTML = '<div class="cn-head">逐段命名'
+        + '<em>留空自动命名；名称同时用于 MP4 与横竖屏封面</em></div>'
+        + items.map(function (it) {
+          return '<div class="cn-row"><span class="cn-no">第 ' + it.n + ' 段</span>'
+            + '<span class="cn-time">' + fmtClock(it.start) + '–' + fmtClock(it.end) + '</span>'
+            + '<input class="cn-inp" type="text" maxlength="80" spellcheck="false"'
+            + ' data-key="' + esc(it.key) + '" placeholder="自动：' + esc(clipAutoName(it))
+            + '" aria-label="第 ' + it.n + ' 段的名称"></div>';
+        }).join('');
+    }
+    Array.prototype.forEach.call(box.querySelectorAll('.cn-inp'), function (inp) {
+      var k = inp.getAttribute('data-key');
+      var v = state.clipNames[k] || '';
+      if (document.activeElement !== inp && inp.value !== v) inp.value = v;
+    });
+  }
+
+  /* 保存结果里的封面候选：每段一张卡，可切「横屏 16:9 / 竖屏 3:4」预览。
+     ⚠️ 保存切片时后端**不写任何封面文件**（只记候选时间点），必须由用户点一张
+        再按「确认使用这一版」才落盘；这里不做任何自动预选。 */
+  function renderClipCovers() {
+    var box = document.getElementById('clip-covers');
+    if (!box) return;
+    var rows = state.clipCovers || [];
+    if (!rows.length) {
+      box.hidden = true;
+      box.innerHTML = '';
+      return;
+    }
+    box.hidden = false;
+    box.innerHTML = '<div class="cc-title">封面候选<em>保存时只记录候选时间点；'
+      + '点一张缩略图选中，再点「确认使用这一版」，才会生成并保存横屏 16:9 / 竖屏 3:4 两张 PNG。</em></div>'
+      + rows.map(function (x) {
+        var c = x.covers || {};
+        var cands = c.candidates || [];
+        var chosen = c.chosen || null;
+        var base = x.name || '';
+        var orient = state.clipCoverOrient[base] || '16x9';
+        var pick = +state.clipCoverPick[base] || 0;
+        var mp4 = x.path || '';
+        var dirty = pick > 0 && (!chosen || pick !== chosen.index);
+        var head = dirty ? ('已选第 ' + pick + ' 版 · 待确认')
+          : (chosen ? ('已确认第 ' + chosen.index + ' 版') : '未选择');
+        var foot;
+        if (dirty) {
+          foot = '<div class="cc-foot"><span>已选第 ' + pick + ' 版</span>'
+            + '<button type="button" class="btn small primary" data-cc-confirm="' + pick
+            + '" data-base="' + esc(base) + '">确认使用这一版</button>'
+            + '<button type="button" class="btn small ghost" data-cc-cancel="1" data-base="'
+            + esc(base) + '">取消选择</button></div>';
+        } else if (chosen) {
+          foot = '<div class="cc-foot muted">已保存：'
+            + esc(base.replace(/\.[^.]+$/, ''))
+            + '_cover_16x9.png / _cover_3x4.png</div>';
+        } else {
+          foot = '<div class="cc-foot muted">点一张缩略图选定封面（不会自动选）</div>';
+        }
+        return '<div class="cc-card" data-base="' + esc(base) + '" data-path="' + esc(mp4) + '">'
+          + '<div class="cc-head"><b title="' + esc(base) + '">' + esc(base) + '</b>'
+          + '<span>' + cands.length + ' 版候选 · ' + head + '</span>'
+          + '<div class="cc-tabs"><button type="button" data-cc-orient="16x9"'
+          + (orient === '16x9' ? ' class="on"' : '') + '>横屏 16:9</button>'
+          + '<button type="button" data-cc-orient="3x4"'
+          + (orient === '3x4' ? ' class="on"' : '') + '>竖屏 3:4</button></div></div>'
+          + '<div class="cc-row' + (orient === '3x4' ? ' portrait' : '') + '">'
+          + cands.map(function (cand) {
+            var src = '/api/clip/cover/preview?path=' + encodeURIComponent(mp4)
+              + '&index=' + cand.index + '&orient=' + orient;
+            var isChosen = !!(chosen && chosen.index === cand.index);
+            var isPick = pick === cand.index && !(chosen && chosen.index === cand.index);
+            var cls = 'cc-item' + (isChosen ? ' is-chosen' : '') + (isPick ? ' is-picked' : '');
+            var badge = isChosen ? '<span class="cc-badge">已确认</span>'
+              : (isPick ? '<span class="cc-badge pick">已选</span>' : '');
+            return '<button type="button" class="' + cls + '" data-cc-pick="' + cand.index
+              + '" data-base="' + esc(base) + '" title="第 ' + cand.index + ' 版 · '
+              + cand.at + ' 秒">'
+              + '<img loading="lazy" alt="第 ' + cand.index + ' 版封面" src="' + src + '">'
+              + '<span class="cc-no">' + cand.index + '</span>' + badge + '</button>';
+          }).join('') + '</div>' + foot + '</div>';
+      }).join('');
+  }
+
+  function confirmClipCover(base, mp4, index, btn) {
+    if (btn) btn.disabled = true;
+    fetch('/api/clip/cover/choose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: mp4, index: index })
+    }).then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+    }).then(function (x) {
+      if (!x.ok) {
+        pvToast('保存封面失败：' + ((x.d && x.d.error) || '未知原因'));
+        if (btn) btn.disabled = false;
+        return;
+      }
+      (state.clipCovers || []).forEach(function (row) {
+        if (row.name === base && row.covers) row.covers.chosen = x.d.chosen;
+      });
+      delete state.clipCoverPick[base];
+      renderClipCovers();
+      pvToast('封面已保存');
+    }).catch(function (e) {
+      if (btn) btn.disabled = false;
+      pvToast('保存封面失败：' + e);
+    });
   }
 
   function updateClipBar() {
@@ -5735,6 +6697,7 @@
       b.classList.toggle('picked', on);
       b.setAttribute('aria-pressed', on ? 'true' : 'false');
     });
+    renderClipNames();
   }
 
   function setClipMode(on) {
@@ -5782,18 +6745,18 @@
 
   function saveClips() {
     if (state.clipBusy) return;
-    var items = [];
-    Object.keys(state.clipSel).forEach(function (k) {
-      var m = state.clipMeta[k];
-      if (m && state.clipSel[k]) items.push(m);
-    });
-    items.sort(function (a, b) {
-      return (a.start - b.start) || (String(a.cid) < String(b.cid) ? -1 : 1);
-    });
+    var items = clipSelectedItems();
     if (!items.length) return;
+    items.forEach(function (it) {
+      var custom = (state.clipNames[it.key] || '').trim();
+      it.name = custom;                       // 留空 → 后端自动命名
+    });
     var inp = document.getElementById('clip-dir');
     var dir = inp ? inp.value.trim() : '';
     state.clipBusy = true;
+    state.clipCovers = [];
+    state.clipCoverPick = {};
+    renderClipCovers();
     updateClipBar();
     clipNote('正在准备保存 ' + items.length + ' 段…');
     postJSON('/api/clip/start', { items: items, dir: dir }).then(function (d) {
@@ -5828,7 +6791,16 @@
       var bad = (d.done || []).filter(function (x) { return !x.ok; });
       var msg = '已保存 ' + ok.length + ' 段到 ' + (d.dir || '');
       if (bad.length) msg += '；失败 ' + bad.length + ' 段：' + (bad[0].error || '');
+      var noCover = ok.filter(function (x) {
+        return !(x.covers && x.covers.candidates && x.covers.candidates.length);
+      });
+      if (noCover.length) msg += '；' + noCover.length + ' 段封面生成失败：'
+        + ((noCover[0].covers && noCover[0].covers.error) || '未知原因');
       clipNote(msg);
+      state.clipCovers = ok.filter(function (x) {
+        return x.covers && x.covers.candidates && x.covers.candidates.length;
+      });
+      renderClipCovers();
     }).catch(function () {
       state.clipBusy = false;
       updateClipBar();
@@ -6513,16 +7485,35 @@
 
     el.ctrlVol.value = el.player.muted ? 0 : el.player.volume;
     el.btnQpClose.addEventListener('click', function () { toggleQuality(false); });
+    var chaptersClose = document.getElementById('chapters-close');
+    if (chaptersClose) chaptersClose.addEventListener('click', function () { toggleChapters(false); });
+    var markClose = document.getElementById('mark-close');
+    if (markClose) markClose.addEventListener('click', function () { toggleMarking(false); });
 
     el.btnLogin.addEventListener('click', openLogin);
     el.btnLogin2.addEventListener('click', function () { toggleQuality(false); openLogin(); });
+    // 顶栏入口：未登录 = 登录；已登录 = 账号状态窗口（同一颗按钮，两种内容）
+    if (el.tbLogin) {
+      TB_LOGIN_ICON = el.tbLoginFace ? el.tbLoginFace.innerHTML : '';
+      el.tbLogin.addEventListener('click', openLogin);
+    }
+    if (el.btnAccLogin) el.btnAccLogin.addEventListener('click', openLogin);
     el.btnLoginClose.addEventListener('click', loginClose);
-    el.btnLogout.addEventListener('click', function () {
+    var close2 = document.getElementById('btn-login-close-2');
+    if (close2) close2.addEventListener('click', loginClose);
+    // 点遮罩空白处关闭（只在点到的确实是遮罩本身时）
+    el.loginPanel.addEventListener('click', function (e) {
+      if (e.target === el.loginPanel) loginClose();
+    });
+    var doLogout = function () {
       fetch('/api/logout').then(function () { return refreshStatus(true); }).then(function () {
+        loginClose();                 // 登出后关掉弹窗，下次点开就是二维码
         state.mediaBase = null;
         applyPlayer(true);
       });
-    });
+    };
+    el.btnLogout.addEventListener('click', doLogout);
+    if (el.btnAccLogout) el.btnAccLogout.addEventListener('click', doLogout);
 
     /* 「分段」「标注」的入口从顶栏搬到了「设置 → 分段与标注」。
        两个面板长在播放器上，所以在设置页点要先切回录播页；面板本身与视图无关，
@@ -6538,6 +7529,7 @@
 
     /* 自动歌切：入口在设置页，面板在播放器下方。识别全部走后端。 */
     if (el.btnOpenSongcut) el.btnOpenSongcut.addEventListener('click', openSongcut);
+    bindRecorder();
     if (el.scRun) el.scRun.addEventListener('click', scStart);
     if (el.scApply) el.scApply.addEventListener('click', scApply);
     if (el.scClose) el.scClose.addEventListener('click', closeSongcut);
@@ -6572,6 +7564,49 @@
     if (clipPickBtn) clipPickBtn.addEventListener('click', pickClipDir);
     var clipSaveBtn = document.getElementById('clip-save');
     if (clipSaveBtn) clipSaveBtn.addEventListener('click', saveClips);
+    var clipNamesBox = document.getElementById('clip-names');
+    if (clipNamesBox) {
+      clipNamesBox.addEventListener('input', function (e) {
+        var inp = e.target.closest ? e.target.closest('.cn-inp') : null;
+        if (!inp) return;
+        state.clipNames[inp.getAttribute('data-key')] = inp.value;
+      });
+    }
+    var clipCoversBox = document.getElementById('clip-covers');
+    if (clipCoversBox) {
+      clipCoversBox.addEventListener('click', function (e) {
+        var tab = e.target.closest ? e.target.closest('[data-cc-orient]') : null;
+        if (tab) {
+          var card = tab.closest('.cc-card');
+          var base = card ? card.getAttribute('data-base') : '';
+          if (base) {
+            state.clipCoverOrient[base] = tab.getAttribute('data-cc-orient');
+            renderClipCovers();
+          }
+          return;
+        }
+        var pickBtn = e.target.closest ? e.target.closest('[data-cc-pick]') : null;
+        if (pickBtn) {
+          var b1 = pickBtn.getAttribute('data-base');
+          state.clipCoverPick[b1] = +pickBtn.getAttribute('data-cc-pick');
+          renderClipCovers();
+          return;
+        }
+        var okBtn = e.target.closest ? e.target.closest('[data-cc-confirm]') : null;
+        if (okBtn) {
+          var card = okBtn.closest('.cc-card');
+          confirmClipCover(okBtn.getAttribute('data-base'),
+            card ? card.getAttribute('data-path') : '',
+            +okBtn.getAttribute('data-cc-confirm'), okBtn);
+          return;
+        }
+        var cancel = e.target.closest ? e.target.closest('[data-cc-cancel]') : null;
+        if (cancel) {
+          delete state.clipCoverPick[cancel.getAttribute('data-base')];
+          renderClipCovers();
+        }
+      });
+    }
     var clipOpenBtn = document.getElementById('btn-clip');
     if (clipOpenBtn) clipOpenBtn.addEventListener('click', function () {
       // 影院模式下面板被 CSS 藏起来（body.theater .chapters-panel{display:none}），
@@ -7081,6 +8116,15 @@
     var colorBox = document.getElementById('ob-color-box');
     var palBox = document.getElementById('ob-palette');
     var picked = null;
+    /* 批量添加（v1.9.21）：关注列表 + 选择态。sel 用对象当集合，mid -> 1。 */
+    var bulk = {loaded: false, list: [], sel: {}, busy: false, filter: ''};
+    var bulkTgl = document.getElementById('ob-bulk-open');
+    var bulkBox = document.getElementById('ob-bulk-box');
+    var bulkGrid = document.getElementById('ob-bulk-grid');
+    var bulkStat = document.getElementById('ob-bulk-stat');
+    var bulkAdd = document.getElementById('ob-bulk-add');
+    var bulkClear = document.getElementById('ob-bulk-clear');
+    var bulkFilter = document.getElementById('ob-bulk-filter');
 
     /* 候选色块：点一下换成那个色（只改本地的 picked，跟着「就听 TA 的」一起提交）。
        用 onclick 赋值而不是 addEventListener —— showPicker 可能被调用多次，
@@ -7124,6 +8168,12 @@
       postJSON('/api/stations/probe', { mid: mid }).then(function (d) {
         if (d.error) { say('<b>' + esc(d.error) + '</b>'); return; }
         picked = d.probe || null;
+        /* 后端可能把「直播间链接/直播间号」换算成了真实 UID（via_room）：
+           输入框直接改成 UID，后面保存/再检测都不会再走错。 */
+        if (picked && picked.mid && picked.mid !== mid) {
+          mid = picked.mid;
+          input.value = mid;
+        }
         var srcs = (picked && picked.sources) || [];
         sel.innerHTML = '<option value="">自动（推荐：以后新系列会自己跟上）</option>'
           + srcs.map(function (s) {
@@ -7166,14 +8216,20 @@
               + '加进来也能用，但回放清单会是空的（等 TA 建了合集或系列再点保存即可）。';
           }
         }
-        say('查到 <b>' + esc((picked && picked.name) || ('UID ' + mid)) + '</b>'
-          + ((picked && picked.room) ? '，房间号 ' + esc(picked.room) : '')
-          + '。确认无误就点「就听 TA 的」。');
+        var who = esc((picked && picked.name) || ('UID ' + mid));
+        if (picked && picked.via_room) {
+          say('你填的是直播间 <b>' + esc(picked.via_room) + '</b>，已换算为 UID <b>'
+            + esc(mid) + '</b>（' + who + '）。确认无误就点「就听 TA 的」。');
+        } else {
+          say('查到 <b>' + who + '</b>'
+            + ((picked && picked.room) ? '，房间号 ' + esc(picked.room) : '')
+            + '。确认无误就点「就听 TA 的」。');
+        }
       }).catch(function () { say('检测失败，请重试'); });
     }
 
     function save() {
-      var mid = (input.value || '').trim();
+      var mid = (picked && picked.mid) ? picked.mid : (input.value || '').trim();
       if (!mid) { say('先填主播 UID'); return; }
       var body = { mid: mid };
       if (picked) {
@@ -7208,6 +8264,108 @@
       });
     }
 
+    function bulkCount() { return Object.keys(bulk.sel).length; }
+
+    function bulkSync() {
+      var n = bulkCount();
+      if (bulkAdd) {
+        bulkAdd.disabled = bulk.busy || n === 0;
+        bulkAdd.textContent = '添加选中的 ' + n + ' 位';
+      }
+    }
+
+    function bulkRender() {
+      if (!bulkGrid) return;
+      var q = (bulk.filter || '').trim().toLowerCase();
+      var shown = bulk.list.filter(function (p) {
+        return !q || (p.uname || '').toLowerCase().indexOf(q) >= 0
+          || String(p.mid).indexOf(q) >= 0;
+      });
+      if (bulk.loaded && bulkStat) {
+        var addedN = bulk.list.filter(function (p) { return p.added; }).length;
+        bulkStat.textContent = '关注 ' + bulk.list.length + ' 位（已添加 ' + addedN + ' 位）'
+          + (q ? ' · 匹配 ' + shown.length : '');
+      }
+      if (!bulk.list.length) {
+        bulkGrid.innerHTML = '<p class="ob-bulk-note" style="margin:0">关注列表里没有可添加的直播间。</p>';
+        bulkSync();
+        return;
+      }
+      if (!shown.length) {
+        bulkGrid.innerHTML = '<p class="ob-bulk-note" style="margin:0">没有匹配的关注。</p>';
+        bulkSync();
+        return;
+      }
+      bulkGrid.innerHTML = shown.map(function (p) {
+        var added = !!p.added;
+        var sel = !!bulk.sel[p.mid];
+        return '<button type="button" class="ob-bulk-card' + (added ? ' added' : '')
+          + (sel ? ' sel' : '') + (p.living ? ' live' : '') + '"'
+          + ' data-bmid="' + esc(p.mid) + '" data-added="' + (added ? '1' : '0') + '"'
+          + ' aria-pressed="' + (sel ? 'true' : 'false') + '"'
+          + (added ? ' aria-disabled="true"' : '') + '>'
+          + '<span class="fw">'
+          + (p.face ? faceHtml(p.face, 'ob-bulk-face', p.uname || p.mid)
+                    : '<span class="ob-bulk-face ob-bulk-face-ph"></span>')
+          + '</span>'
+          + '<span class="nm" title="' + esc(p.uname) + '">' + esc(p.uname || p.mid) + '</span>'
+          + (added ? '<span class="tag">已添加</span>' : '<i class="mark">✓</i>')
+          + '</button>';
+      }).join('');
+      bindFaceFallback(bulkGrid);
+      bulkSync();
+    }
+
+    function bulkLoad(force) {
+      if (bulk.loaded && !force) return;
+      if (bulkStat) bulkStat.textContent = '正在读取关注列表…';
+      fetch('/api/stations/following' + (force ? '?refresh=1' : ''))
+        .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+        .then(function (x) {
+          if (!x.ok || !x.d || x.d.error) {
+            if (bulkStat) bulkStat.textContent = (x.d && x.d.error) || '读取关注列表失败';
+            return;
+          }
+          bulk.loaded = true;
+          bulk.list = x.d.list || [];
+          bulkRender();
+        })
+        .catch(function () { if (bulkStat) bulkStat.textContent = '读取关注列表失败'; });
+    }
+
+    function bulkSet(card, on) {
+      if (!card || card.getAttribute('data-added') === '1') return;
+      var mid = card.getAttribute('data-bmid');
+      if (!mid) return;
+      if (on) bulk.sel[mid] = 1;
+      else delete bulk.sel[mid];
+      card.classList.toggle('sel', on);
+      card.setAttribute('aria-pressed', on ? 'true' : 'false');
+      bulkSync();
+    }
+
+    var bulkDrag = { on: false, mode: true };
+
+    function bulkBind() {
+      if (!bulkGrid || bulkGrid.getAttribute('data-bound') === '1') return;
+      bulkGrid.setAttribute('data-bound', '1');
+      bulkGrid.addEventListener('pointerdown', function (e) {
+        var card = e.target.closest ? e.target.closest('.ob-bulk-card') : null;
+        if (!card) return;
+        e.preventDefault();
+        bulkDrag.on = true;
+        bulkDrag.mode = !card.classList.contains('sel');
+        bulkSet(card, bulkDrag.mode);
+      });
+      bulkGrid.addEventListener('pointermove', function (e) {
+        if (!bulkDrag.on) return;
+        var el = document.elementFromPoint(e.clientX, e.clientY);
+        var card = el && el.closest ? el.closest('.ob-bulk-card') : null;
+        if (card) bulkSet(card, bulkDrag.mode);
+      });
+      window.addEventListener('pointerup', function () { bulkDrag.on = false; });
+    }
+
     function renderCards(list) {
       if (!grid) return;
       grid.innerHTML = list.map(function (s) {
@@ -7224,6 +8382,87 @@
     }
 
     renderCards(STATIONS || []);
+    bulkBind();
+    if (bulkTgl && bulkBox) {
+      bulkTgl.onclick = function () {
+        var open = bulkBox.hidden;
+        bulkBox.hidden = !open;
+        form.classList.toggle('bulk-open', open);
+        bulkTgl.textContent = open ? '收起关注列表' : '从关注列表批量添加 →';
+        if (open) bulkLoad(false);
+      };
+    }
+    if (bulkFilter) {
+      bulkFilter.oninput = function () {
+        bulk.filter = bulkFilter.value || '';
+        bulkRender();
+      };
+    }
+    if (bulkClear) {
+      bulkClear.onclick = function () {
+        bulk.sel = {};
+        Array.prototype.forEach.call(bulkGrid.querySelectorAll('.ob-bulk-card.sel'), function (c) {
+          c.classList.remove('sel');
+          c.setAttribute('aria-pressed', 'false');
+        });
+        bulkSync();
+      };
+    }
+    if (bulkAdd) {
+      bulkAdd.onclick = function () {
+        var mids = Object.keys(bulk.sel);
+        if (!mids.length || bulk.busy) return;
+        bulk.busy = true;
+        bulkSync();
+        if (bulkStat) bulkStat.textContent = '正在添加 ' + mids.length + ' 位…';
+        postJSON('/api/stations/bulk', { mids: mids }).then(function (d) {
+          bulk.busy = false;
+          if (d.error) {
+            if (bulkStat) bulkStat.textContent = d.error;
+            bulkSync();
+            return;
+          }
+          var added = d.added || [];
+          var skipped = d.skipped || [];
+          var failed = d.failed || [];
+          added.forEach(function (x) {
+            var card = bulkGrid.querySelector('[data-bmid="' + x.mid + '"]');
+            if (!card) return;
+            card.classList.add('added');
+            card.classList.remove('sel');
+            card.setAttribute('data-added', '1');
+            card.setAttribute('aria-disabled', 'true');
+            var mark = card.querySelector('.mark');
+            if (mark) mark.remove();
+            if (!card.querySelector('.tag')) {
+              var tag = document.createElement('span');
+              tag.className = 'tag';
+              tag.textContent = '已添加';
+              card.appendChild(tag);
+            }
+          });
+          bulk.sel = {};
+          bulkSync();
+          if (bulkStat) {
+            bulkStat.textContent = '已添加 ' + added.length + ' 位'
+              + (skipped.length ? '，跳过已在列表的 ' + skipped.length + ' 位' : '')
+              + (failed.length ? '，失败 ' + failed.length + ' 位（'
+                 + esc((failed[0] && failed[0].error) || '') + '）' : '');
+          }
+          return fetch('/api/stations').then(function (r) { return r.json(); })
+            .then(function (dd) {
+              if (dd && dd.stations) {
+                STATIONS = dd.stations;
+                renderCards(STATIONS);
+              }
+            });
+        }).catch(function () {
+          bulk.busy = false;
+          bulkSync();
+          if (bulkStat) bulkStat.textContent = '添加失败，请重试';
+        });
+      };
+    }
     if (grid) {
       grid.addEventListener('click', function (e) {
         var t = e.target;
@@ -7377,10 +8616,45 @@
       scProgress: document.getElementById('songcut-progress'),
       scBar: document.getElementById('songcut-bar'),
       scList: document.getElementById('songcut-list'),
+      rcGrid: document.getElementById('rc-grid'),
+      rcNav: document.getElementById('rc-nav'),
+      rcNavRooms: document.getElementById('rc-nav-rooms'),
+      rcNavFiles: document.getElementById('rc-nav-files'),
+      rcNavRoomsList: document.getElementById('rc-nav-rooms-list'),
+      rcNavLog: document.getElementById('rc-nav-log'),
+      rcHeadPill: document.getElementById('rc-head-pill'),
+      rcViewBtn: document.getElementById('rc-view-btn'),
+      rcViewMenu: document.getElementById('rc-view-menu'),
+      rcSetTray: document.getElementById('set-tray'),
+      rcAuto: document.getElementById('rc-auto'),
+      rcAuto2: document.getElementById('rc-auto2'),
+      rcMeta: document.getElementById('rc-meta'),
+      rcFiles: document.getElementById('rc-files'),
+      rcFilesStat: document.getElementById('rc-files-stat'),
+      rcLog: document.getElementById('rc-log'),
+      rcDir: document.getElementById('rc-dir'),
+      rcPick: document.getElementById('rc-pick'),
+      rcRefresh: document.getElementById('rc-refresh'),
+      rcOpenDir: document.getElementById('rc-open-dir'),
+      rcAllStart: document.getElementById('rc-all-start'),
+      rcAllStop: document.getElementById('rc-all-stop'),
       scClose: document.getElementById('songcut-close'),
       qualityPanel: document.getElementById('quality-panel'),
       btnQpClose: document.getElementById('btn-qp-close'),
       btnLogin: document.getElementById('btn-login'),
+      tbLogin: document.getElementById('tb-login'),
+      tbLoginFace: document.getElementById('tb-login-face'),
+      tbLoginName: document.getElementById('tb-login-name'),
+      lpAnon: document.getElementById('lp-anon'),
+      lpMe: document.getElementById('lp-me'),
+      lpTitle: document.getElementById('lp-title'),
+      lpFace: document.getElementById('lp-face'),
+      lpName: document.getElementById('lp-name'),
+      lpUid: document.getElementById('lp-uid'),
+      lpVip: document.getElementById('lp-vip'),
+      setAccState: document.getElementById('set-acc-state'),
+      btnAccLogin: document.getElementById('btn-acc-login'),
+      btnAccLogout: document.getElementById('btn-acc-logout'),
       playerBox: document.getElementById('player-box'),
       pvTitle: document.getElementById('pv-title'),
       ctrlBuffer: document.getElementById('ctrl-buffer'),

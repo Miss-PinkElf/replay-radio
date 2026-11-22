@@ -818,20 +818,105 @@ tr.live-row td { background: color-mix(in srgb, var(--red) 7%, transparent); }
 .quality-sel option { background: var(--panel-2); color: #e8e8ec; }
 
 /* 扫码登录面板：盖在画面上，不跳走 */
+/* v1.9.16：从「播放器内的绝对定位覆盖层」改成全局 fixed 弹窗。
+   原因：录播姬 / DD 会把播放器缩到 1px，原来那三处入口在有播放器的板块才点得到。
+   z-index 1200：要压过切页遮罩（1100）。 */
 .login-panel {
-  position: absolute;
+  position: fixed;
   inset: 0;
-  z-index: 4;
+  z-index: 1200;
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 11px;
-  background: rgba(8, 8, 10, .95);   /* fallback：老浏览器不支持 color-mix */
-  background: color-mix(in srgb, var(--bg) 95%, transparent);
+  padding: 24px;
+  background: rgba(0, 0, 0, .55);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
 }
 .login-panel[hidden] { display: none; }
+.login-box {
+  width: min(360px, 100%);
+  padding: 16px 20px 20px;
+  border: 1px solid var(--line-2);
+  border-radius: 14px;
+  background: var(--panel);
+  box-shadow: 0 24px 60px rgba(0, 0, 0, .45);
+}
+.lp-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.lp-head b { font-size: 14px; font-weight: 600; color: var(--text); }
+.lp-x {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.lp-x:hover { background: rgba(var(--ink), .1); color: var(--text); }
+.lp-note { margin: 9px 0 0; font-size: 11.5px; color: var(--muted); text-align: center; line-height: 1.6; }
+.lp-anon[hidden], .lp-me[hidden] { display: none; }
+
+/* 已登录：头像 + 昵称 + UID（这就是「当前登录 ID 的状态窗口」） */
+.lp-me { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 4px 0 6px; }
+.lp-face {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(var(--ink), .08);
+  color: var(--muted);
+  font-size: 20px;
+}
+.lp-face img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.lp-face .lp-face-img-ph { font-size: 20px; color: var(--muted); }
+.lp-me-id { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.lp-me-id b { font-size: 14px; font-weight: 600; color: var(--text); }
+.lp-me-id span { font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.lp-me-id em {
+  margin-top: 2px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #fb7299;
+  color: #fff;
+  font-size: 10.5px;
+  font-style: normal;
+}
+.lp-btns { display: flex; gap: 8px; margin-top: 4px; }
+
+/* 顶栏的账号入口。
+   ⚠️ 文字用 .tb-login-txt 而不是 .gbtxt：@media(max-width:1600px) 会把 .gbtxt 全藏掉，
+      那样未登录时只剩一个与「主播空间」几乎一样的图标，看不出是登录入口。
+   未登录：只有「登录」两个字（两字约 24px，比原来那颗图标还多 4px，不会撑破顶栏）；
+   已登录：只有头像（名字放 title）。 */
+.tb-login { gap: 6px; }
+.tb-login-txt { white-space: nowrap; }
+#tb-login:not(.on) .tb-login-face { display: none; }
+#tb-login.on .tb-login-txt { display: none; }
+.tb-login-face {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  overflow: hidden;
+  flex: 0 0 auto;
+  background: rgba(var(--ink), .08);
+}
+.tb-login-face svg { width: 13px; height: 13px; display: block; }
+.tb-login-face img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.tb-login-face .tb-face-ph { font-size: 9px; color: var(--muted); }
+.tb-login.on .tb-login-face { background: rgba(var(--ink), .14); }
 .login-qr {
+  margin: 0 auto;
   width: 168px;
   height: 168px;
   padding: 8px;
@@ -1572,6 +1657,23 @@ body.view-multi .pv-ratewrap { display: none; }
    与分段面板同一套外观：它也是「本场的工具」，放在播放器下方同一列。
    行内要能改起止时间与歌名，所以输入框要小、要能缩（288px 侧栏下也放得下）。 */
 .sc-close { float: right; margin-top: -2px; }
+/* 各功能面板统一的 ✕ 关闭按钮（本场分段 / 标注片段） */
+.panel-x {
+  float: right;
+  margin: -2px -4px 0 0;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  line-height: 24px;
+  text-align: center;
+  cursor: pointer;
+}
+.panel-x:hover { background: rgba(var(--ink), .08); color: var(--text); }
 .sc-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0 4px; }
 .sc-progress {
   height: 4px;
@@ -1849,6 +1951,180 @@ body.theater .strip-fold { display: flex; }
 .clip-dir:focus { border-color: color-mix(in srgb, var(--red) 55%, var(--line)); }
 .clip-note { font-size: var(--fs-fine); line-height: 1.6; color: var(--muted); margin: 0 0 8px; }
 .clip-note:empty { display: none; }
+
+/* ---- 逐段命名与封面候选（v1.9.19）
+   面板在右栏（320~600px）里，所以命名行走「段号 + 时间 + 输入框」三列，
+   封面用横向滚动条而不是换行堆高。 */
+.clip-names {
+  margin: 0 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.clip-names[hidden] { display: none; }
+.cn-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-fine);
+  color: var(--text-2);
+}
+.cn-head em { font-style: normal; font-size: 11px; color: var(--muted); }
+.cn-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+}
+.cn-row:last-child { border-bottom: 0; }
+.cn-no { flex: 0 0 auto; font-size: 11.5px; color: var(--muted); }
+.cn-time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted-2);
+  font-variant-numeric: tabular-nums;
+}
+.cn-inp {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 11.5px;
+}
+.cn-inp:focus { outline: none; border-color: var(--red); }
+.cn-inp::placeholder { color: var(--muted-2); }
+
+.clip-covers { margin: 2px 0 10px; }
+.clip-covers[hidden] { display: none; }
+.cc-title { font-size: var(--fs-fine); color: var(--text-2); margin-bottom: 6px; }
+.cc-title em {
+  display: block;
+  margin-top: 2px;
+  font-style: normal;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+.cc-card {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.cc-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-bottom: 6px;
+}
+.cc-head b {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+}
+.cc-head span { font-size: 11px; color: var(--muted); }
+.cc-tabs {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 6px;
+  background: rgba(var(--ink), .05);
+}
+.cc-tabs button {
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.cc-tabs button.on {
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .18);
+}
+.cc-row {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 3px;
+}
+.cc-item {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg);
+  cursor: zoom-in;
+}
+.cc-item img { display: block; width: 132px; height: 74px; object-fit: cover; }
+.cc-row.portrait .cc-item img { width: 78px; height: 104px; }
+.cc-item.is-picked {
+  border-color: color-mix(in srgb, var(--text) 55%, transparent);
+  box-shadow: 0 0 0 2px rgba(var(--ink), .12);
+}
+.cc-item.is-chosen {
+  border-color: color-mix(in srgb, var(--red) 62%, transparent);
+  box-shadow: 0 0 0 2px var(--red-soft);
+}
+.cc-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.cc-foot.muted { color: var(--muted); }
+.cc-foot .btn { padding: 4px 10px; font-size: 11.5px; }
+.cc-no {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, .62);
+  color: #fff;
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+}
+.cc-badge {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  padding: 1px 6px;
+  border-top-left-radius: 6px;
+  background: var(--red);
+  color: var(--on-red);
+  font-size: 10px;
+  line-height: 16px;
+}
+.cc-badge.pick { background: rgba(0, 0, 0, .62); color: #fff; }
 .cpick {
   display: none; flex: none; position: relative;
   width: 14px; height: 14px; border-radius: 4px;
@@ -4119,6 +4395,90 @@ body.view-multi .col-right { display: none; }
 .ob-go { margin-top: 18px; width: 100%; justify-content: center; }
 .ob-go[hidden] { display: none; }
 
+/* 从关注列表批量添加（v1.9.21）：表单展开成两倍宽，卡片按可用宽度自动排。
+   拖动框选靠 pointerdown + pointerover，所以整块要 user-select:none。 */
+.ob-card-form { transition: max-width .2s ease; }
+.ob-card-form.bulk-open { max-width: 780px; }
+/* .ob-card 是 flex column + align-items:center，子项默认按内容宽度收缩；
+   批量区要占满表单宽度，显式 stretch。 */
+.ob-bulk {
+  align-self: stretch;
+  width: 100%;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+.ob-bulk-open {
+  display: block; width: 100%; padding: 9px;
+  border: 1px dashed var(--line-2); border-radius: 9px;
+  background: none; color: var(--text-2);
+  font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.ob-bulk-open:hover { border-color: var(--red); color: var(--text); }
+.ob-bulk-open[hidden] { display: none; }
+.ob-bulk-box[hidden] { display: none; }
+.ob-bulk-box { margin-top: 12px; }
+.ob-bulk-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.ob-bulk-filter {
+  flex: 0 1 190px; min-width: 120px;
+  padding: 5px 9px;
+  border: 1px solid var(--line); border-radius: 7px;
+  background: var(--panel-2); color: var(--text);
+  font: inherit; font-size: 12px; outline: none;
+}
+.ob-bulk-filter:focus { border-color: var(--red); }
+.ob-bulk-stat { font-size: 12px; color: var(--muted); }
+.ob-bulk-link {
+  margin-left: auto; padding: 0; border: 0; background: none;
+  color: var(--muted); font: inherit; font-size: 12px;
+  text-decoration: underline; cursor: pointer;
+}
+.ob-bulk-link:hover { color: var(--text); }
+.ob-bulk-note { margin: 8px 0 0; font-size: 11.5px; line-height: 1.6; color: var(--muted-2); }
+.ob-bulk-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
+  gap: 8px;
+  max-height: 300px;
+  overflow: auto;
+  margin-top: 10px;
+  padding: 2px;
+  user-select: none;
+}
+.ob-bulk-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--panel-2);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.ob-bulk-card:hover { border-color: var(--line-2); }
+.ob-bulk-card.sel { border-color: var(--red); background: var(--red-soft); }
+.ob-bulk-card.added { opacity: .55; cursor: default; }
+.ob-bulk-card .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ob-bulk-card .fw { position: relative; flex: 0 0 auto; display: grid; }
+.ob-bulk-card.live .fw::after {
+  content: ""; position: absolute; right: 0; bottom: 0;
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red); border: 1.5px solid var(--panel-2);
+}
+.ob-bulk-face {
+  width: 28px; height: 28px; border-radius: 50%;
+  object-fit: cover; background: var(--panel);
+}
+.ob-bulk-face-ph { display: grid; place-items: center; font-size: 12px; color: var(--muted); }
+.ob-bulk-card .tag { margin-left: auto; font-size: 10px; color: var(--muted); white-space: nowrap; }
+.ob-bulk-card .mark { display: none; margin-left: auto; font-size: 11px; font-style: normal; color: var(--red); }
+.ob-bulk-card.sel .mark { display: block; }
+
 .ob-foot { margin-top: 26px; font-size: 12px; color: var(--muted-2); text-align: center; }
 .ob-foot a { color: var(--muted); }
 .ob-foot a:hover { color: var(--text); }
@@ -4986,6 +5346,22 @@ body.view-dd .col-right {
   pointer-events: none;
 }
 
+/* 录播姬：整页全宽。房间卡片 + 文件 + 日志的信息量比播放器重要，
+   沿用「右栏 60% 播放器」会把正文压到 400px（房间卡只能排一列）。
+   播放器**不卸载**，只缩成 1px —— 与 DD 板块同一套做法，回放不会中断。 */
+body.view-recorder .wrap {
+  grid-template-columns: minmax(0, 1fr);
+}
+body.view-recorder .col-right {
+  position: absolute;
+  top: 0; left: 0;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
 /* DD 内部子标签（圆角胶囊，选中实心） */
 .dd-subtabs { display: flex; gap: 8px; margin: 14px 0 0; flex-wrap: wrap; }
 .dd-sub {
@@ -5410,4 +5786,571 @@ body.view-dd .views { grid-column: 1 / -1; }
   .ddp-grid { grid-template-columns: minmax(0, 1fr); }
   .ddp-board { max-height: 260px; }
   .ddp-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* ---------------------------------------------------------------- 录播姬（v1.9.15）
+   房间卡片沿用 .live-card 的观感（panel 底 + 1px 线 + 12px 圆角），只是把
+   「名字 / 状态 / 标题 / 两个 ID / 按钮」压进一张 132px 高的卡里，
+   所以内边距比 .live-card 略小。前缀统一 rc-，与其他板块零重叠。 */
+
+.rc-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 14px;
+}
+.rc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+.rc-meta b { color: var(--text); font-weight: 500; }
+.rc-meta .warn { color: #c8862a; }
+.rc-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+
+/* 两栏：左侧功能区 / 右侧内容区。
+   左栏观感对齐录播页的 .strip（12px 小标题 + 12px 条目 + 8px 圆角 + rgba(ink,.035) 底），
+   但类名独立 —— .strip 在非录播板块是 display:none，复用会被连带藏掉。 */
+.rc-layout {
+  display: grid;
+  grid-template-columns: 208px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+}
+.rc-side { display: flex; flex-direction: column; position: sticky; top: 76px; }
+.rc-side-h {
+  margin: 4px 0 8px;
+  padding-left: 2px;
+  font-size: 12px;
+  color: var(--muted-2);
+}
+.rc-side-h:not(:first-child) { margin-top: 16px; }
+
+.rc-nav { display: flex; flex-direction: column; gap: 3px; }
+.rc-nav button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: rgba(var(--ink), .035);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background .15s, border-color .15s, color .15s;
+}
+.rc-nav button:hover { background: rgba(var(--ink), .08); color: var(--text); }
+.rc-nav button.on {
+  background: var(--red-soft);
+  border-color: color-mix(in srgb, var(--red) 42%, transparent);
+  color: var(--text);
+}
+.rc-cnt {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.rc-nav-rooms button { font-size: 11.5px; gap: 7px; }
+.rc-nav-rooms .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rc-nav-rooms .dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted-2);
+}
+.rc-nav-rooms .dot.rec { background: var(--red); }
+.rc-nav-rooms .dot.wait { background: #c8862a; }
+.rc-nav-rooms .dot.err { background: #d9534f; }
+.rc-nav button[disabled] { opacity: .55; cursor: default; }
+/* 从左栏点房间 → 右侧对应卡片闪一下，让人知道点到了哪张 */
+.rc-room.flash {
+  border-color: color-mix(in srgb, var(--red) 60%, transparent);
+  box-shadow: 0 0 0 3px var(--red-soft);
+}
+
+.rc-auto {
+  margin-top: 16px;
+  padding: 10px 11px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+.rc-auto-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text);
+  cursor: pointer;
+}
+.rc-auto-row input { width: 14px; height: 14px; accent-color: var(--red); flex: 0 0 auto; }
+.rc-auto-note { margin: 6px 0 0; font-size: 11px; line-height: 1.6; color: var(--muted); }
+.rc-auto-inline { margin-top: 4px; }
+
+.rc-main { min-width: 0; }
+.rc-pane[hidden] { display: none; }
+
+.rc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.rc-room {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-height: 132px;
+  padding: 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+}
+.rc-room-h { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+.rc-room-h b {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rc-st {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.rc-st i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.rc-st.rec { color: var(--red); }
+.rc-st.rec i { animation: rcPulse 1.5s ease-in-out infinite; }
+.rc-st.wait { color: #c8862a; }
+@keyframes rcPulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+
+.rc-title {
+  margin: 0;
+  min-height: 18px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-2);
+  /* 标题可能很长（B 站标题常带一堆 emoji），两行截断，完整内容放 title */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.rc-ids { display: flex; flex-wrap: wrap; gap: 10px; font-size: 11.5px; color: var(--muted); }
+.rc-err {
+  margin: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--red);
+  /* 类里没写 display，但 .rc-btns 的兄弟节点会继承 flex 行的对齐，这里显式收回 */
+  word-break: break-all;
+}
+.rc-err[hidden] { display: none; }
+
+.rc-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; }
+.rc-btns .btn { padding: 5px 11px; font-size: 12px; }
+
+.rc-add {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+  min-height: 132px;
+  padding: 13px 14px;
+  border: 1px dashed var(--line-2);
+  border-radius: 12px;
+}
+.rc-add b { font-size: 13px; font-weight: 500; color: var(--text-2); text-align: center; }
+/* 输入行整体一行高：不写死高度时按钮会被 input 的默认行高撑到 44px，圆角一放大像颗药丸 */
+.rc-add-row { display: flex; align-items: center; gap: 6px; }
+.rc-add-row .rc-input { height: 30px; }
+.rc-add-row .btn { height: 30px; padding: 0 12px; font-size: 12px; }
+
+.rc-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.rc-input:focus { outline: none; border-color: var(--red); }
+.rc-sel {
+  padding: 6px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  color-scheme: light dark;
+}
+
+.rc-card { margin-bottom: 14px; }
+.rc-hsub {
+  margin-left: 8px;
+  font-style: normal;
+  font-weight: 400;
+  font-size: 12px;
+  color: var(--muted);
+}
+.rc-dirrow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.rc-dirrow .rc-input { flex: 1 1 240px; }
+
+.rc-files { display: flex; flex-direction: column; max-height: 280px; overflow-y: auto; }
+.rc-file {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 78px 116px;
+  gap: 10px;
+  align-items: center;
+  padding: 5px 2px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12.5px;
+}
+.rc-file:last-child { border-bottom: 0; }
+.rc-file .nm { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rc-file .sz,
+.rc-file .tm {
+  text-align: right;
+  font-size: 11.5px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.rc-log {
+  max-height: 216px;
+  overflow-y: auto;
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--text-2);
+}
+.rc-log div { display: flex; gap: 8px; }
+.rc-log .t { flex: 0 0 auto; color: var(--muted); }
+.rc-log .lv { flex: 0 0 32px; }
+.rc-log .lv-ok { color: #2f7d4a; }
+.rc-log .lv-warn { color: #b8791f; }
+.rc-log .lv-err { color: var(--red); }
+.rc-log .msg { min-width: 0; word-break: break-all; }
+
+/* ---- 头部工具条 + 「视图」菜单（v1.9.17） ---- */
+.rc-head {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  margin-bottom: 14px;
+}
+.rc-head-txt { min-width: 0; }
+.rc-head-txt .sub { margin-bottom: 0; }
+.rc-head-side {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  padding-top: 4px;
+}
+.rc-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.rc-pill i {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.rc-pill.rec {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 40%, transparent);
+  background: var(--red-soft);
+}
+.rc-pill.rec i { animation: rcPulse 1.5s ease-in-out infinite; }
+.rc-pill.wait { color: #c8862a; }
+
+.rc-menu-wrap { position: relative; }
+.rc-menu {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 60;
+  min-width: 232px;
+  padding: 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  background: var(--panel-2);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, .38);
+}
+.rc-menu[hidden] { display: none; }
+.rc-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.rc-menu button:hover { background: rgba(var(--ink), .08); color: var(--text); }
+.rc-menu button i {
+  flex: 0 0 12px;
+  position: relative;
+  height: 12px;
+}
+.rc-menu button i::before {
+  content: "";
+  position: absolute;
+  left: 1px;
+  top: 2px;
+  width: 8px;
+  height: 4px;
+  border-left: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  transform: rotate(-45deg);
+  opacity: 0;
+}
+.rc-menu button[aria-checked="true"] { color: var(--text); }
+.rc-menu button[aria-checked="true"] i::before { opacity: 1; }
+.rc-menu-sep { height: 1px; margin: 5px 8px; background: var(--line); }
+
+/* ---- 设置表单（开关 / 单选 / 输入行） ---- */
+.rc-set-pane .live-card { margin-bottom: 14px; }
+.rc-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+.rc-opt-t {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 13px;
+  color: var(--text);
+}
+.rc-opt-t em {
+  font-style: normal;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+.rc-opt > input[type="checkbox"] {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.rc-sw {
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 22px;
+  margin-top: 1px;
+  border-radius: 11px;
+  background: rgba(var(--ink), .18);
+  transition: background .16s;
+}
+.rc-sw::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, .28);
+  transition: transform .16s;
+}
+.rc-opt > input[type="checkbox"]:checked + .rc-sw { background: var(--red); }
+.rc-opt > input[type="checkbox"]:checked + .rc-sw::after { transform: translateX(16px); }
+.rc-opt > input[type="checkbox"]:focus-visible + .rc-sw { outline: 2px solid var(--text); outline-offset: 2px; }
+.rc-opt-tight { padding-top: 2px; }
+
+.rc-radio {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 6px 0;
+  cursor: pointer;
+  font-size: 13px;
+}
+/* ⚠️ 只藏「单选圆钮本身」：写成 .rc-radio input 会把同一行里的
+   「分片大小 / 分片时长」数字输入框也一起藏掉（宽度 0 + 透明，肉眼以为控件没渲染）。 */
+.rc-radio > input[type="radio"] {
+  position: absolute;
+  width: 0;
+  height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.rc-radio i {
+  position: relative;
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  border: 1.5px solid var(--line-2);
+  border-radius: 50%;
+}
+.rc-radio > input[type="radio"]:checked + i { border-color: var(--red); }
+.rc-radio > input[type="radio"]:checked + i::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 50%;
+  background: var(--red);
+}
+.rc-radio > input[type="radio"]:focus-visible + i { outline: 2px solid var(--text); outline-offset: 2px; }
+.rc-radio span {
+  display: block;
+  min-width: 0;
+}
+/* ⚠️ 不能用 flex column：这样「按大小分段 + 输入框 + MB」会被拆成三行。
+   用普通行内流，b 后面直接跟输入框，窄了才自然折行。 */
+.rc-radio b { font-weight: 400; color: var(--text); }
+.rc-radio em { display: block; margin-top: 3px; font-style: normal; font-size: 11.5px; color: var(--muted); }
+.rc-radio .rc-num { display: inline-block; margin: 0 4px; vertical-align: middle; }
+.rc-num { flex: 0 0 76px; width: 76px; padding: 3px 6px; }
+.rc-textarea {
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 64px;
+  resize: vertical;
+  line-height: 1.6;
+  font-family: ui-monospace, Consolas, "Cascadia Mono", monospace;
+}
+.rc-sub-h { margin: 12px 0 2px; font-size: 12px; color: var(--muted-2); }
+.rc-set-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.rc-lab {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.rc-lab em { font-style: normal; font-size: 11px; line-height: 1.5; color: var(--muted); }
+.rc-inline { display: flex; align-items: center; gap: 8px; }
+.rc-inline .rc-input { flex: 1 1 auto; }
+
+/* ---- 房间卡片（v1.9.17：头像 + 房间号 + 分区 / 体积） ---- */
+.rc-room { min-height: 168px; }
+.rc-room-top { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.rc-face {
+  flex: 0 0 auto;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: rgba(var(--ink), .08);
+}
+.rc-face-ph {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: var(--muted);
+}
+.rc-room-id { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.rc-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rc-room-no { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.rc-room-no span { display: block; line-height: 1.45; }
+.rc-room-top .rc-st { margin-left: auto; }
+.rc-meta-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+.rc-meta-row .rc-area {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rc-meta-row .rc-size { margin-left: auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+.rc-file { grid-template-columns: minmax(0, 1fr) 78px 116px 52px; }
+.rc-file .op { text-align: right; }
+.rc-mini {
+  padding: 2px 7px;
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.rc-mini:hover { color: var(--text); border-color: var(--red); }
+/* 「视图 → 显示直播间标题和分区」关掉时，卡片里这两行一起收掉 */
+.rc-hide-meta .rc-title,
+.rc-hide-meta .rc-area { display: none; }
+/* ⚠️ .rc-nav button 写了 display:flex，会盖掉 [hidden]，显隐必须显式补一条 */
+.rc-nav button[hidden] { display: none; }
+
+@media (max-width: 900px) {
+  /* 左栏折成横向标签条：竖排 208px 在窄屏里会把内容区压到不可用 */
+  .rc-layout { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .rc-side { position: static; }
+  .rc-side-h { display: none; }
+  .rc-nav { flex-direction: row; flex-wrap: wrap; }
+  .rc-nav button { width: auto; }
+  .rc-nav-rooms { display: none; }
+  .rc-auto { margin-top: 10px; }
+}
+
+@media (max-width: 640px) {
+  /* 窄屏只留文件名与大小；时间放不下时先砍 —— 文件名里本来就带开录时间 */
+  .rc-file { grid-template-columns: minmax(0, 1fr) 70px; }
+  .rc-file .tm { display: none; }
+  .rc-bar .rc-actions { margin-left: 0; }
 }
