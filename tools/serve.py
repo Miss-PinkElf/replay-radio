@@ -1096,6 +1096,8 @@ STATIONLESS_OK = (
     "/api/page/alive", "/api/page/bye",
     "/api/protocol/register", "/api/protocol/unregister",
     "/api/following/live",     # 只依赖登录态，与有没有注册主播无关
+    "/api/feedback", "/api/feedback/conf",   # 反馈是本机功能，与主播无关
+    "/api/feedback/upload", "/api/feedback/reveal",
     "/api/live/ws",            # 同上：房间号由 URL 带，跟注册表无关
     # 歌单：导入的是任意 B 站投稿，与注册表里有没有主播无关（首批用户就是先导歌单）
     "/api/playlists", "/api/playlist",
@@ -1166,7 +1168,7 @@ def urlopen(req, timeout):
 # ---------------------------------------------------------------- 版本更新
 # 检查只请求 GitHub Releases API（失败再退官网 version.json）；下载与替换 EXE
 # 全部由用户点了「立即更新」之后才发生 —— 启动时绝不自动下载、安装或重启。
-APP_VERSION = "1.9.23"     # 与 build_exe.py:APP_VERSION / site/index.html:VERSION 同步
+APP_VERSION = "1.9.28"     # 与 build_exe.py:APP_VERSION / site/index.html:VERSION 同步
 UPDATE_REPO = "DcC176/replay-radio"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
 UPDATE_SITE = "https://dcc176.github.io/replay-radio/version.json"
@@ -1378,6 +1380,487 @@ def api_update_apply():
         UPDATE_JOB["stage"] = "applying"
     threading.Thread(target=rc_quit_async, args=("更新应用",), daemon=True).start()
     return 200, {"ok": True}
+
+
+# ---------------------------------------------------------------- 反馈 / 错误上报
+# 方案取舍（成本 / 可行性 / 隐私）：
+#   · GitHub Issues：零后端，但要求用户有 GH 账号、内容公开、还要能贴日志 →
+#     门槛高、隐私风险最大，只做成「引导用户自己去提」的次要入口；
+#   · 在线表单/腾讯文档：要账号、要维护表格、还要配 CORS 或中转 → 成本不低；
+#   · 本机 JSONL + 可选 webhook：零依赖、离线可用、默认不出网 → 选它。
+# 默认只写 `data/feedback/feedback-YYYYMM.jsonl`；`data/feedback.json` 里配了
+# `{"webhook": "https://..."}` 才会额外 POST 一份（企业微信/飞书/Slack 的机器人地址都能接）。
+FEEDBACK_DIR = os.path.join(ROOT, "data", "feedback")
+FEEDBACK_ATTACH = os.path.join(FEEDBACK_DIR, "attach")
+FEEDBACK_CONF = os.path.join(ROOT, "data", "feedback.json")
+FEEDBACK_KINDS = ("bug", "idea", "other")
+FEEDBACK_MAX = 4000
+FEEDBACK_FIELD_MAX = 2000
+# 只收这些诊断字段：**不碰** SESSDATA / Cookie / 完整路径。多收一个字段就多一分隐私风险。
+FEEDBACK_FIELDS = ("app", "version", "build", "view", "station", "ua",
+                   "platform", "screen", "errors", "theme", "lang", "zoom", "route")
+# 默认收集地址：ntfy.sh 的一个**私有主题**（随机串，等同口令，没订阅就收不到）。
+# 想换成自己的服务器：data/feedback.json 里写 {"upload_url": "https://..."}；
+# 关掉默认上传：{"upload": false}（提交后会直接打开保存文件夹）。
+FEEDBACK_UPLOAD_URL = "https://ntfy.sh/rr-fb-2a7c41d9e6b35f80"
+FEEDBACK_UPLOAD_ON = True
+FEEDBACK_IMG_MAX = 3
+FEEDBACK_IMG_BYTES = 4 * 1024 * 1024
+FEEDBACK_LOG_LINES = 120
+
+
+def _feedback_conf():
+    try:
+        with open(FEEDBACK_CONF, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def _feedback_target():
+    """收集地址与是否默认上传。配置写坏了就退回内置的默认值，功能不能因此不可用。"""
+    c = _feedback_conf()
+    url = str(c.get("upload_url") or c.get("webhook") or FEEDBACK_UPLOAD_URL).strip()
+    if not url.startswith("https://"):
+        url = FEEDBACK_UPLOAD_URL
+    on = c.get("upload")
+    if not isinstance(on, bool):
+        on = FEEDBACK_UPLOAD_ON
+    return {"upload": on, "url": url}
+
+
+def _feedback_host(url):
+    try:
+        return urllib.parse.urlparse(url).hostname or url
+    except Exception:
+        return url
+
+
+def _feedback_context(ctx):
+    out = {}
+    if not isinstance(ctx, dict):
+        return out
+    for k in FEEDBACK_FIELDS:
+        v = ctx.get(k)
+        if v in (None, ""):
+            continue
+        if isinstance(v, list):
+            out[k] = [str(x)[:200] for x in v[:5]]
+        else:
+            out[k] = str(v)[:300]
+    return out
+
+
+def _feedback_log_tail():
+    """日志末尾若干行。凭据一律先涂掉 —— 反馈是要发出去的，不能夹带 SESSDATA。"""
+    p = os.path.join(APPDIR, "log.txt")
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()[-FEEDBACK_LOG_LINES:]
+    except Exception:
+        return []
+    out = []
+    for ln in lines:
+        x = ln.rstrip("\n")
+        x = re.sub(r"(?i)(SESSDATA|bili_jct|cookie)\s*[=:]\s*\S+", r"\1=***", x)
+        x = re.sub(r"[A-Za-z]:\\Users\\[^\\\s]+", r"<user>", x)
+        out.append(x[:400])
+    return out
+
+
+def _feedback_norm(rec):
+    """兼容 v1.9.26 的旧记录（当时叫 text、图片是磁盘路径），统一成内部结构。"""
+    return {
+        "id": str(rec.get("id") or ""),
+        "at": int(rec.get("at") or time.time()),
+        "kind": str(rec.get("kind") or "other"),
+        "summary": str(rec.get("summary") or rec.get("text") or ""),
+        "steps": str(rec.get("steps") or ""),
+        "trigger": str(rec.get("trigger") or ""),
+        "actual": str(rec.get("actual") or ""),
+        "expected": str(rec.get("expected") or ""),
+        "context": rec.get("context") if isinstance(rec.get("context"), dict) else {},
+        "logs": rec.get("logs") if isinstance(rec.get("logs"), list) else [],
+        "images": rec.get("images") if isinstance(rec.get("images"), list) else [],
+    }
+
+
+def _feedback_images(images):
+    """把前端压好的 dataURL 收进文档本身（base64），不再单独落盘。
+
+    以前截图放在 attach/<编号>/ 下、md 里写相对路径，结果是「一条反馈三个文件」，
+    转发时经常只带走 md、图丢了。现在图片就是文档里的一个字段。
+    """
+    out = []
+    if not isinstance(images, list):
+        return out
+    for i, im in enumerate(images[:FEEDBACK_IMG_MAX]):
+        if not isinstance(im, dict):
+            continue
+        raw = str(im.get("data") or "")
+        mime = str(im.get("type") or "")
+        if raw.startswith("data:") and "," in raw:
+            head, raw = raw.split(",", 1)
+            mime = head[5:].split(";")[0] or mime
+        try:
+            blob = base64.b64decode(raw, validate=False)
+        except Exception:
+            continue
+        ext = {"image/png": "png", "image/jpeg": "jpg",
+               "image/webp": "webp", "image/gif": "gif"}.get(mime)
+        if not blob or not ext or len(blob) > FEEDBACK_IMG_BYTES:
+            continue
+        out.append({"name": "shot-%d.%s" % (i + 1, ext), "type": mime,
+                    "size": len(blob),
+                    "sha256": hashlib.sha256(blob).hexdigest()[:16],
+                    "data": "data:%s;base64,%s"
+                            % (mime, base64.b64encode(blob).decode("ascii"))})
+    return out
+
+
+def _feedback_md(rec):
+    """人读版正文（作为文档的 markdown 字段，不再单独写 .md 文件）。"""
+    c = rec.get("context") or {}
+    lines = ["# 反馈 %s" % rec.get("id"), "",
+             "- 时间：%s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rec["at"])),
+             "- 类型：%s" % rec.get("kind"), ""]
+    for label, key in (("概述", "summary"), ("复现步骤", "steps"),
+                       ("触发条件", "trigger"), ("异常表现", "actual"),
+                       ("期望结果", "expected")):
+        v = (rec.get(key) or "").strip()
+        if v:
+            lines += ["## " + label, "", v, ""]
+    lines += ["## 环境", "", "```json",
+              json.dumps(c, ensure_ascii=False, indent=2), "```", ""]
+    logs = rec.get("logs") or []
+    if logs:
+        lines += ["## 日志末尾（%d 行，已涂掉凭据）" % len(logs), "", "```", *logs, "```", ""]
+    imgs = rec.get("images") or []
+    if imgs:
+        lines += ["## 截图（已内嵌在 images 字段）", ""]
+        for im in imgs:
+            lines.append("- `%s`（%d KB，sha256 %s）"
+                         % (im.get("name"), int(im.get("size") or 0) // 1024,
+                            im.get("sha256")))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _feedback_document(rec):
+    """一条反馈 = 一个自包含文档：正文、环境、日志、截图全在里面。
+
+    上传时**原样发送这个 JSON**，接收端不需要再去别处找附件；
+    markdown 字段是同一份内容的人读版，方便直接贴进 Issue。
+    """
+    ctx = rec.get("context") or {}
+    return {
+        "schema": "replay-radio-feedback",
+        "schema_version": 1,
+        "id": rec["id"],
+        "created_at": rec["at"],
+        "created_at_local": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rec["at"])),
+        "app": "ReplayRadio",
+        "version": str(ctx.get("version") or ""),
+        "build": str(ctx.get("build") or ""),
+        "kind": rec["kind"],
+        "report": {
+            "summary": rec.get("summary") or "",
+            "steps": rec.get("steps") or "",
+            "trigger": rec.get("trigger") or "",
+            "actual": rec.get("actual") or "",
+            "expected": rec.get("expected") or "",
+        },
+        "environment": ctx,
+        "logs": {"source": "log.txt", "lines": rec.get("logs") or []},
+        "images": rec.get("images") or [],
+        "markdown": _feedback_md(rec),
+    }
+
+
+def _feedback_write(doc):
+    """写 `<编号>.json`。先写 .part 再替换，避免用户恰好在这时打开看到半个文件。"""
+    os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    path = os.path.join(FEEDBACK_DIR, doc["id"] + ".json")
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(doc, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+    return path
+
+
+def _feedback_summary(doc):
+    """给推送通道看的纯文本：一条消息就能读懂「什么问题、怎么复现、什么环境」。"""
+    rep = doc.get("report") or {}
+    c = doc.get("environment") or {}
+    bits = ["[%s] %s" % (doc.get("kind"), rep.get("summary") or "(无概述)")]
+    for label, key in (("复现", "steps"), ("触发", "trigger"),
+                       ("异常", "actual"), ("期望", "expected")):
+        v = (rep.get(key) or "").strip()
+        if v:
+            bits.append(label + ": " + v.replace("\n", " / ")[:300])
+    env = " · ".join(x for x in (
+        ("v" + str(doc.get("version") or "")).strip("v"),
+        str(doc.get("build") or ""),
+        str(c.get("view") or ""),
+        str(c.get("station") or ""),
+        str(c.get("screen") or ""),
+        str(c.get("platform") or "")) if x)
+    if env:
+        bits.append("环境: " + env)
+    errs = c.get("errors") or []
+    if errs:
+        bits.append("最近报错: " + " | ".join(str(e)[:120] for e in errs[:3]))
+    bits.append("截图: %d 张 · 文档 %s.json · 编号 %s"
+                % (len(doc.get("images") or []), doc.get("id"), doc.get("id")))
+    return "\n".join(bits)[:3500]
+
+
+def _feedback_upload(doc):
+    """把**这个单一文档**发到配置的收集地址。
+
+    · ntfy.sh：先发可读摘要（推送里能直接看），再把整份 JSON 作为**一个附件**上传；
+    · 其他 HTTPS 地址：直接 POST 这份 JSON 的原始字节。
+    无论哪条通道，接收方拿到的都是同一个自包含文件，不用再拼 md / 图片。
+    """
+    t = _feedback_target()
+    url = t["url"]
+    host = _feedback_host(url)
+    is_ntfy = host.endswith("ntfy.sh")
+    raw = json.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
+    name = "FB-%s.json" % doc.get("id")
+    out = {"ok": False, "target": host, "at": int(time.time()),
+           "document": name, "bytes": len(raw)}
+    try:
+        if is_ntfy:
+            req = urllib.request.Request(
+                url, data=_feedback_summary(doc).encode("utf-8"), method="POST",
+                headers={"User-Agent": UA, "Content-Type": "text/plain; charset=utf-8",
+                         "Title": "ReplayRadio feedback", "Tags": "speech_balloon",
+                         "Priority": "default"})
+            with urlopen(req, 15) as r:
+                out["status"] = getattr(r, "status", 200)
+            out["ok"] = 200 <= int(out.get("status") or 0) < 300
+            req2 = urllib.request.Request(url, data=raw, method="PUT", headers={
+                "User-Agent": UA, "Filename": name,
+                "Title": "ReplayRadio feedback document", "Tags": "page_facing_up"})
+            with urlopen(req2, 25) as r2:
+                out["doc_status"] = getattr(r2, "status", 200)
+            out["ok"] = bool(out["ok"]) and 200 <= int(out.get("doc_status") or 0) < 300
+        else:
+            req = urllib.request.Request(
+                url, data=raw,
+                headers={"Content-Type": "application/json; charset=utf-8",
+                         "User-Agent": UA, "X-Feedback-Id": str(doc.get("id") or "")})
+            with urlopen(req, 25) as r:
+                out["status"] = getattr(r, "status", 200)
+            out["ok"] = 200 <= int(out.get("status") or 0) < 300
+    except Exception as e:
+        out["error"] = str(e)[:160]
+    return out
+
+
+def _feedback_migrate_legacy():
+    """把 v1.9.27 及更早的「jsonl + md + attach」并成一条一个 JSON。
+
+    旧文件不删，整批移到 `legacy/`（可逆、可回溯）；新文档写完才移动，
+    中途失败最多留下旧文件，不会丢反馈。
+    """
+    try:
+        names = os.listdir(FEEDBACK_DIR)
+    except OSError:
+        return
+    olds = [n for n in names if n.startswith("feedback-") and n.endswith(".jsonl")]
+    if not olds and not any(n in names for n in ("attach", "upload-state.json")):
+        return
+    made = 0
+    for n in olds:
+        try:
+            fh = open(os.path.join(FEEDBACK_DIR, n), encoding="utf-8")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = _feedback_norm(json.loads(line))
+                except ValueError:
+                    continue
+                if not rec["id"]:
+                    continue
+                dst = os.path.join(FEEDBACK_DIR, rec["id"] + ".json")
+                if os.path.exists(dst):
+                    continue
+                # 旧记录的图片只存了路径：读回来嵌进文档，再丢掉路径字段
+                fixed = []
+                for im in rec["images"]:
+                    if not isinstance(im, dict):
+                        continue
+                    item = dict(im)
+                    if not item.get("data") and item.get("path"):
+                        try:
+                            with open(os.path.join(ROOT, str(item["path"]).replace("/", os.sep)),
+                                      "rb") as f:
+                                blob = f.read()
+                            item["data"] = "data:%s;base64,%s" % (
+                                item.get("type") or "image/jpeg",
+                                base64.b64encode(blob).decode("ascii"))
+                            item["size"] = len(blob)
+                        except OSError:
+                            pass
+                    item.pop("path", None)
+                    fixed.append(item)
+                rec["images"] = fixed
+                try:
+                    _feedback_write(_feedback_document(rec))
+                    made += 1
+                except OSError:
+                    pass
+    legacy = os.path.join(FEEDBACK_DIR, "legacy")
+    try:
+        os.makedirs(legacy, exist_ok=True)
+    except OSError:
+        return
+    for n in names:
+        if n == "legacy":
+            continue
+        if not (n.startswith("feedback-") and n.endswith(".jsonl")) \
+                and not n.endswith(".md") and n not in ("attach", "upload-state.json"):
+            continue
+        try:
+            shutil.move(os.path.join(FEEDBACK_DIR, n), os.path.join(legacy, n))
+        except Exception:
+            pass
+    print("[feedback] 旧反馈已合并为单文档：新增 %d 个 JSON，旧文件在 data/feedback/legacy/" % made)
+
+
+def _feedback_find(fid):
+    """按编号取回文档（一键上传 / 打开文件夹用）。旧的 jsonl 会顺手迁移。"""
+    if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}", str(fid or "")):
+        return None
+    path = os.path.join(FEEDBACK_DIR, str(fid) + ".json")
+    if not os.path.exists(path):
+        _feedback_migrate_legacy()
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _feedback_reveal(fid=""):
+    """在资源管理器里定位到这份反馈文档（Windows）；其他平台只回路径。"""
+    path = os.path.join(FEEDBACK_DIR, (str(fid) + ".json") if fid else "")
+    if not fid or not os.path.exists(path):
+        path = FEEDBACK_DIR
+    try:
+        os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    except OSError:
+        pass
+    # 自动化验收用：只回路径，不真的弹窗（CI/截图时不该抢焦点）
+    if os.environ.get("REPLAY_NO_REVEAL") == "1":
+        return {"ok": True, "suppressed": True,
+                "path": os.path.relpath(path, ROOT).replace("\\", "/")}
+    if os.name != "nt":
+        return {"ok": False, "path": os.path.relpath(path, ROOT).replace("\\", "/")}
+    try:
+        if os.path.isfile(path):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        else:
+            subprocess.Popen(["explorer", os.path.normpath(path)])
+        return {"ok": True, "path": os.path.relpath(path, ROOT).replace("\\", "/")}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:80],
+                "path": os.path.relpath(path, ROOT).replace("\\", "/")}
+
+
+def api_feedback_conf():
+    _feedback_migrate_legacy()
+    t = _feedback_target()
+    return 200, {"upload": t["upload"], "target": _feedback_host(t["url"]),
+                 "url": t["url"] if t["upload"] else ""}
+
+
+def api_feedback(obj):
+    _feedback_migrate_legacy()      # 提交前先并一次旧文件，避免新旧格式混在目录里
+    kind = str(obj.get("kind") or "other")
+    if kind not in FEEDBACK_KINDS:
+        kind = "other"
+    txt = {k: str(obj.get(k) or "").strip()[:FEEDBACK_FIELD_MAX]
+           for k in ("text", "steps", "trigger", "actual", "expected")}
+    if len(txt["text"]) + len(txt["steps"]) + len(txt["actual"]) < 4:
+        return 400, {"error": "请至少写一句概述，或填一下现象 / 复现步骤"}
+    if len(txt["text"]) > FEEDBACK_MAX:
+        return 400, {"error": "概述最多 %d 字" % FEEDBACK_MAX}
+    fid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+    ctx = _feedback_context(obj.get("context"))
+    rec = {
+        "id": fid,
+        "at": int(time.time()),
+        "kind": kind,
+        "summary": txt["text"],
+        "steps": txt["steps"],
+        "trigger": txt["trigger"],
+        "actual": txt["actual"],
+        "expected": txt["expected"],
+        "context": ctx,
+        # 有诊断信息才带日志：用户明确关掉诊断时不该偷偷收集日志
+        "logs": _feedback_log_tail() if ctx else [],
+        "images": _feedback_images(obj.get("images")),
+    }
+    doc = _feedback_document(rec)
+    try:
+        path = _feedback_write(doc)
+    except OSError as e:
+        return 500, {"error": "写入本机失败：%s" % str(e)[:80]}
+    out = {"ok": True, "id": fid,
+           "stored": os.path.relpath(path, ROOT).replace("\\", "/"),
+           "dir": "data/feedback",
+           "images": len(doc["images"])}
+    t = _feedback_target()
+    want = obj.get("upload")
+    do_up = t["upload"] if not isinstance(want, bool) else want
+    if do_up:
+        res = _feedback_upload(doc)
+        out["upload"] = res
+        doc["upload"] = {"at": res.get("at"), "ok": bool(res.get("ok")),
+                         "target": res.get("target"), "document": res.get("document"),
+                         "error": res.get("error", "")}
+        try:
+            _feedback_write(doc)
+        except OSError:
+            pass
+        if not res.get("ok"):
+            out["warn"] = "已保存到本机，但上传失败：%s" % (res.get("error") or "对方未接受")
+    else:
+        # 明确不上传：直接把保存位置弹出来，省得用户去翻 data 目录
+        out["reveal"] = _feedback_reveal(fid)
+    return 200, out
+
+
+def api_feedback_upload(obj):
+    """一键（重新）上传：按编号取回文档，原样再发一次。"""
+    doc = _feedback_find(obj.get("id"))
+    if not doc:
+        return 404, {"error": "找不到这条反馈（编号不对或文件已被移走）"}
+    res = _feedback_upload(doc)
+    doc["upload"] = {"at": res.get("at"), "ok": bool(res.get("ok")),
+                     "target": res.get("target"), "document": res.get("document"),
+                     "error": res.get("error", "")}
+    try:
+        _feedback_write(doc)
+    except OSError:
+        pass
+    return (200 if res.get("ok") else 502), {"ok": bool(res.get("ok")),
+                                             "id": doc.get("id"), **res}
+
+
+def api_feedback_reveal(obj):
+    return 200, _feedback_reveal(str(obj.get("id") or ""))
 
 
 # B 站风控：请求太密会回 412（响应体 code=-412「request was banned」），持续几十分钟。
@@ -2447,6 +2930,34 @@ def _rc_room_info(room):
             "living": int(x.get("live_status") or 0) == 1,
             "area": (parent + " · " + area) if (parent and area) else (area or parent),
             "cover": x.get("keyframe") or x.get("user_cover") or ""}
+
+
+_BRIEF = {}          # room -> {"at": ts, "d": {...}}：顶栏那行小字，30 秒够新鲜
+
+
+def api_live_brief():
+    """当前主播的「直播简报」：在播与否 + 标题。给顶栏选择器显示，不进主状态面板。
+
+    房间信息接口本身就带标题，一次请求就够；失败时给上一次结果并标注 stale，
+    顶栏那行字退化成一居「状态未知」，但不该因此报错刷屏。
+    """
+    room = cur_room()
+    now = time.time()
+    c = _BRIEF.get(room)
+    if c and now - c["at"] < 30:
+        return 200, c["d"]
+    try:
+        info = _rc_room_info(room)
+        d = {"room": room, "living": bool(info.get("living")),
+             "title": info.get("title") or "", "area": info.get("area") or "",
+             "at": int(now)}
+    except Exception as e:
+        if c:
+            return 200, dict(c["d"], stale=True, error=str(e)[:80])
+        return 200, {"room": room, "living": False, "title": "",
+                     "error": str(e)[:80], "at": int(now)}
+    _BRIEF[room] = {"at": now, "d": d}
+    return 200, d
 
 
 def _rc_master(uid):
@@ -4446,14 +4957,178 @@ def _danmaku_ready():
     return bool(sess and jct)
 
 
-def _send_danmaku(msg):
-    """发一条弹幕，返回 (B 站 code, message)。code=0 才是成功。"""
+# ---------------------------------------------------------------- 直播间表情
+# B 站直播的表情分三类：通用（official_*）/ UP 主大表情 / 房间专属（room_*）。
+# 面板数据来自 GetEmoticons；发送**不能**走普通文字通道（发出去只会变成一串文字），
+# 要用 dm_type=1 + msg=emoticon_unique + emoticonOptions（url/宽高）。
+# 本地还支持一个可替换的表情包清单（assets/emoticons/packs.json），
+# 接口取不到/离线时至少还有它。
+LIVE_EMOTE_API = "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
+LIVE_EMOTE_TTL = 600
+LIVE_EMOTE = {}
+LIVE_EMOTE_LOCK = threading.Lock()
+LOCAL_EMOTE_FILE = os.path.join(ROOT, "assets", "emoticons", "packs.json")
+
+
+def _emote_item(e):
+    url = str(e.get("url") or "").strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    url = url.replace("http://", "https://")
+    return {
+        "u": str(e.get("emoticon_unique") or ""),
+        "name": str(e.get("emoji") or e.get("descript") or ""),
+        "url": url,
+        "w": int(e.get("width") or 0),
+        "h": int(e.get("height") or 0),
+        "bulge": int(e.get("bulge_display") or 0),
+        "perm": int(e.get("perm") or 0),
+        "need_level": int(e.get("unlock_need_level") or 0),
+        "need_gift": int(e.get("unlock_need_gift") or 0),
+        "unlock": str(e.get("unlock_show_text") or ""),
+    }
+
+
+def _local_emote_packs():
+    """可替换的本地表情包（读不到就当没有，不影响功能）。
+
+    文件格式：
+      {"packs":[{"id":"my","name":"我的表情","emoticons":[
+          {"unique":"my_1","name":"开心","url":"happy.png","width":120,"height":120}]}]}
+    `url` 写相对路径时按 assets/emoticons/ 解析；也可以直接写 http(s) 地址。
+    """
+    try:
+        with open(LOCAL_EMOTE_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+    except Exception:
+        return []
+    packs = []
+    for p in (d.get("packs") or []):
+        items = []
+        for e in (p.get("emoticons") or []):
+            u = str(e.get("unique") or "").strip()
+            if not u:
+                continue
+            url = str(e.get("url") or "").strip()
+            if url and not url.startswith(("http://", "https://", "/")):
+                url = "/assets/emoticons/" + url.lstrip("./")
+            items.append({"u": u, "name": str(e.get("name") or ""), "url": url,
+                          "w": int(e.get("width") or 0), "h": int(e.get("height") or 0),
+                          "bulge": 0, "perm": 1, "need_level": 0, "need_gift": 0,
+                          "unlock": ""})
+        if items:
+            packs.append({"id": str(p.get("id") or p.get("name") or "local"),
+                          "name": str(p.get("name") or "本地表情"), "type": 0,
+                          "items": items})
+    return packs
+
+
+def _live_emote_fetch(room):
+    """从 B 站取当前直播间的表情包（需要登录态才会有房间专属那一包）。"""
+    hdrs = {
+        "User-Agent": UA,
+        "Referer": "https://live.bilibili.com/%s" % room,
+        "Accept": "application/json, text/plain, */*",
+    }
+    sess = load_credentials()[0]
+    if sess:
+        hdrs["Cookie"] = "SESSDATA=%s" % sess
+    url = "%s?platform=pc&room_id=%s" % (LIVE_EMOTE_API, urllib.parse.quote(str(room)))
+    with cached_get(url, hdrs, timeout=15) as r:
+        status = getattr(r, "status", 200)
+        body = r.read()
+    if status >= 400:
+        raise RuntimeError("HTTP %d" % status)
+    d = json.loads(body.decode("utf-8", "replace"))
+    if d.get("code") != 0:
+        raise RuntimeError("code=%s %s" % (d.get("code"), d.get("message")))
+    packs = []
+    for p in ((d.get("data") or {}).get("data") or []):
+        items = [_emote_item(e) for e in (p.get("emoticons") or [])]
+        items = [x for x in items if x["u"] and x["url"]]
+        if items:
+            packs.append({"id": str(p.get("pkg_id") or ""),
+                          "name": str(p.get("pkg_name") or ""),
+                          "type": int(p.get("pkg_type") or 0), "items": items})
+    return packs
+
+
+def live_emote_packs(force=False):
+    """当前直播间的表情包（10 分钟缓存；失败时 30 秒后允许重试）。
+
+    ⚠️ 失败不抛给前端：至少把本地包给出去，面板不该整块空掉。
+    """
+    room = cur_room()
+    now = time.time()
+    with LIVE_EMOTE_LOCK:
+        hit = LIVE_EMOTE.get(room)
+        if hit and not force:
+            ttl = LIVE_EMOTE_TTL if hit["remote"] else 30
+            if now - hit["at"] < ttl:
+                return hit
+    remote, err = [], ""
+    try:
+        remote = _live_emote_fetch(room)
+    except Exception as e:
+        err = str(e)[:120]
+    packs = remote + _local_emote_packs()
+    out = {"at": now, "packs": packs, "remote": bool(remote), "error": err}
+    with LIVE_EMOTE_LOCK:
+        LIVE_EMOTE[room] = out
+    return out
+
+
+def api_live_emoticons(force=False):
+    d = live_emote_packs(force)
+    body = {"room": cur_room(), "packs": d["packs"],
+            "source": "bili" if d["remote"] else ("local" if d["packs"] else "none")}
+    if d["error"]:
+        body["error"] = d["error"]
+    return 200, body
+
+
+def _live_emote_find(unique):
+    """按 emoticon_unique 找表情（发之前必须校验：不能把任意 url 塞给 B 站）。"""
+    u = str(unique or "").strip()
+    if not u:
+        return None
+    for p in live_emote_packs()["packs"]:
+        for it in p["items"]:
+            if it["u"] != u:
+                continue
+            # 只有 B 站自己的图能作为表情素材发给 B 站
+            if not re.match(r"^https://[\w.-]*hdslb\.com/", it["url"] or ""):
+                return None
+            return it
+    return None
+
+
+def _send_danmaku(msg, emote=None):
+    """发一条弹幕，返回 (B 站 code, message)。code=0 才是成功。
+
+    emote 不为空时走**表情通道**：B 站把大表情/房间表情当独立类型，
+    普通文字通道发出去只会显示成一串文字（实测「不能用 [表情名] 兜底」）。
+    """
     _, jct = load_credentials()
-    body = urllib.parse.urlencode({
+    fields = {
         "bubble": "0", "msg": msg, "color": "16777215", "mode": "1",
         "fontsize": "25", "roomid": cur_room(), "rnd": str(int(time.time())),
         "csrf": jct, "csrf_token": jct,
-    }).encode("utf-8")
+    }
+    if emote:
+        fields.update({
+            "dm_type": "1",
+            "msg": emote["u"],
+            "emoticonOptions": json.dumps({
+                "bulge_display": int(emote.get("bulge") or 0),
+                "emoticon_unique": emote["u"],
+                "height": int(emote.get("h") or 40),
+                "width": int(emote.get("w") or 40),
+                "in_player_area": 1,
+                "url": emote["url"],
+            }, ensure_ascii=False),
+        })
+    body = urllib.parse.urlencode(fields).encode("utf-8")
     sess = load_credentials()[0]
     req = urllib.request.Request("https://api.live.bilibili.com/msg/send", data=body, headers={
         "User-Agent": UA,
@@ -4471,6 +5146,20 @@ def _send_danmaku(msg):
 
 
 def api_live_send(obj):
+    em = obj.get("emoticon")
+    if em is not None:
+        if not isinstance(em, dict):
+            return 400, {"error": "表情参数不合法"}
+        item = _live_emote_find(em.get("unique"))
+        if not item:
+            return 404, {"error": "这个表情不在当前直播间的表情包里（可能已下架或没有权限）"}
+        if int(item.get("perm") or 0) != 1:
+            return 403, {"error": "这个表情当前不可发送"}
+        if not _danmaku_ready():
+            return 403, {"error": "发弹幕需要登录，并粘贴 bili_jct（直播间页右侧有入口）"}
+        code, message = _send_danmaku("", item)
+        return (200 if code == 0 else 502), {"code": code, "message": message,
+                                             "emoticon": item["u"]}
     msg = str(obj.get("msg") or "").strip()
     if not msg:
         return 400, {"error": "弹幕内容不能为空"}
@@ -4701,7 +5390,12 @@ def _fill_live_stream(out, room, qn):
 #    再往上只会把风控窗口撑长（代价比省下的几百毫秒大得多）。
 FOLLOWING_API = "https://api.bilibili.com/x/relation/followings"
 FOLLOW_PAGE = 50                 # 每页条数（接口上限）
-FOLLOW_PAGE_MAX = 60             # 最多翻 60 页 = 3000 个关注（防呆上限）
+# 防跑飞上限，不是业务上限：实际页数由第一页返回的 total 决定。
+# 60 页（3000）曾经是硬截断，4837 个关注里有 1837 人从来没被查过 ——
+# 在播人数天生少算一截，还查不出原因（只在日志里写「3000 人」）。
+# 400 页 = 20000 个关注，正常账号远远够用。
+FOLLOW_PAGE_MAX = 400
+FOLLOW_PAGE_RETRY = 2            # 单页失败重试次数（0.6s / 1.2s 退避）
 # 开播状态一次带多少个 uid。对照实验（2026-10-13，同一批 150 个 uid）：
 # 3×50 与 1×150 返回的条目、在播集合**完全一致** → 放大批次不丢人，
 # 但请求数从 32 降到 11（1588 个关注）。⚠️ 别只看「返回条数 < 请求条数」就
@@ -4713,7 +5407,10 @@ FOLLOW_UIDS_TTL = 1800           # 关注关系变化很慢，uid 名单缓存�
 # 落盘缓存：进程重启后第一次进监控室也不必干等（实测冷启动约 1.2 秒）。
 # 超过这个时长就当作没有 —— 半年前的名单没有意义。
 FOLLOW_DISK = os.path.join(ROOT, "data", "follow_cache.json")
-FOLLOW_DISK_TTL = 86400
+# 落盘缓存只负责「刚重启就有一份东西可画」。在播名单是会过期的：晚上 88 位、
+# 次日白天只剩 36 位是正常现象，所以最多认一小时 —— 之前给 24 小时，
+# 结果 20 小时前的名单被当成「当前在播」，格子里全写着「未开播」。
+FOLLOW_DISK_TTL = 3600
 FOLLOW_CACHE = {"at": 0.0, "list": [], "uids": [], "uids_at": 0.0, "busy": False,
                 "disk_tried": False}
 FOLLOW_LOCK = threading.Lock()
@@ -4747,22 +5444,52 @@ def _follow_json(url, referer):
 
 
 def _follow_page(uid, pn):
-    """翻一页，返回 uid 列表；取不到返回 None（由调用方判断是整体失败还是留旧数据）。"""
-    try:
-        d = _follow_json("%s?vmid=%s&pn=%d&ps=%d" % (FOLLOWING_API, uid, pn, FOLLOW_PAGE),
-                         REFERER)
-    except Exception as e:
-        print("[follow] 第 %d 页取失败：%s" % (pn, e))
-        return None
-    if d.get("code") != 0:
-        print("[follow] 第 %d 页 code=%s %s" % (pn, d.get("code"), d.get("message")))
-        return None
-    return [str(u.get("mid")) for u in ((d.get("data") or {}).get("list") or [])
-            if u.get("mid")]
+    """翻一页，返回 uid 列表；取不到返回 None。
+
+    单页失败先退避重试（网络抖动 / 瞬时 412）。`code != 0` 不重试 ——
+    那是账号级风控或参数错，重试只会把风控窗口撑长。
+    """
+    for attempt in range(FOLLOW_PAGE_RETRY + 1):
+        try:
+            d = _follow_json("%s?vmid=%s&pn=%d&ps=%d" % (FOLLOWING_API, uid, pn, FOLLOW_PAGE),
+                             REFERER)
+        except Exception as e:
+            print("[follow] 第 %d 页取失败（第 %d 次）：%s" % (pn, attempt + 1, e))
+            d = None
+        if d is not None:
+            if d.get("code") != 0:
+                print("[follow] 第 %d 页 code=%s %s" % (pn, d.get("code"), d.get("message")))
+                return None
+            return [str(u.get("mid")) for u in ((d.get("data") or {}).get("list") or [])
+                    if u.get("mid")]
+        if attempt < FOLLOW_PAGE_RETRY:
+            time.sleep(0.6 * (attempt + 1))
+    return None
+
+
+def _dedupe_uids(uids):
+    """按出现顺序去重。
+
+    翻页期间关注关系会变（用户自己取消/新增关注），同一个人可能出现在两页里；
+    不去重会让他在「在播名单」里出现两次，左栏就会重复。
+    """
+    seen = set()
+    out = []
+    for u in uids:
+        u = str(u or "").strip()
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
 
 
 def _following_uids():
-    """关注的全部 uid（半小时缓存；翻页并发跑）。"""
+    """关注的全部 uid（半小时缓存；翻页并发跑）。
+
+    页数由第一页的 `total` 决定，不再写死上限；单页失败会重试，
+    仍失败则整体抛错（缺页 = 名单不完整，宁可沿用旧数据）。
+    """
     now = time.time()
     if FOLLOW_CACHE["uids"] and now - FOLLOW_CACHE["uids_at"] < FOLLOW_UIDS_TTL:
         return FOLLOW_CACHE["uids"]
@@ -4773,9 +5500,15 @@ def _following_uids():
     if first.get("code") != 0:
         raise RuntimeError("关注列表 code=%s %s" % (first.get("code"), first.get("message")))
     data = first.get("data") or {}
+    total = int(data.get("total") or 0)
     out = [str(u.get("mid")) for u in (data.get("list") or []) if u.get("mid")]
-    pages = min(max(1, (int(data.get("total") or 0) + FOLLOW_PAGE - 1) // FOLLOW_PAGE),
-                FOLLOW_PAGE_MAX)
+    pages = min(max(1, (total + FOLLOW_PAGE - 1) // FOLLOW_PAGE), FOLLOW_PAGE_MAX)
+    if total <= 0:
+        # 0 个关注是合法状态，不是错误
+        FOLLOW_CACHE["uids"] = []
+        FOLLOW_CACHE["uids_at"] = now
+        print("[follow] 关注名单为空")
+        return []
     if pages > 1:
         todo = list(range(2, pages + 1))
         with concurrent.futures.ThreadPoolExecutor(
@@ -4788,10 +5521,14 @@ def _following_uids():
             raise RuntimeError("关注列表有 %d/%d 页取失败（%s…）"
                                % (len(failed), pages, ", ".join(str(p) for p in failed[:5])))
         for g in got:
-            out.extend(g)
+            out.extend(g or [])
+    raw_n = len(out)
+    out = _dedupe_uids(out)
     FOLLOW_CACHE["uids"] = out
     FOLLOW_CACHE["uids_at"] = now
-    print("[follow] 关注名单 %d 人（%d 页，并发 %d）" % (len(out), pages, FOLLOW_WORKERS))
+    print("[follow] 关注名单 %d 人（total=%d、%d 页、并发 %d%s）"
+          % (len(out), total, pages, FOLLOW_WORKERS,
+             "、去重 %d 条" % (raw_n - len(out)) if raw_n != len(out) else ""))
     return out
 
 
@@ -4881,7 +5618,12 @@ def _follow_batch(batch):
 
 
 def _follow_live_fetch():
-    """同步跑完整条链：名单 → 并发查开播 → 按人气排序。"""
+    """同步跑完整条链：名单 → 并发查开播 → 按人气排序。
+
+    ⚠️ 只要**有一批**取失败就必须整体抛错：那一批里的在播主播会整批消失，
+       对比旧数据看起来就像「大家都下播了」，会被当成正常结果写进缓存。
+       以前只在「所有批都失败」时才抛，单批失败会被静默吞掉。
+    """
     uids = _following_uids()
     batches = [uids[i:i + FOLLOW_BATCH] for i in range(0, len(uids), FOLLOW_BATCH)]
     live = []
@@ -4889,11 +5631,18 @@ def _follow_live_fetch():
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(FOLLOW_WORKERS, len(batches))) as ex:
             got = list(ex.map(_follow_batch, batches))
-        if all(g is None for g in got):
-            raise RuntimeError("开播状态全部取失败（可能被限流）")
+        # 失败批次单独重试一次（间隔 0.4 秒，避开瞬时 412 / 连接被关）
+        for i, g in enumerate(got):
+            if g is None:
+                time.sleep(0.4)
+                got[i] = _follow_batch(batches[i])
+        missing = [i + 1 for i, g in enumerate(got) if g is None]
+        if missing:
+            raise RuntimeError("开播状态有 %d/%d 批取失败（第 %s 批，可能被限流）"
+                               % (len(missing), len(batches),
+                                  "、".join(str(x) for x in missing[:5])))
         for g in got:
-            if g:
-                live.extend(g)
+            live.extend(g)
     live.sort(key=lambda x: -(x.get("online") or 0))    # 人多的排前面，监控场景直觉
     return live
 
@@ -4902,7 +5651,8 @@ def _follow_disk_load():
     """把上次落盘的名单 / 在播列表装回内存（进程重启后第一次进监控室不必干等）。
 
     任何异常都当作「没有缓存」—— 缓存不该把功能带崩。只装「还新鲜」的东西：
-    在播列表给 24 小时（当 stale 用，后台会立刻刷新），名单给 `FOLLOW_UIDS_TTL`。
+    在播列表只认 `FOLLOW_DISK_TTL`（1 小时，当 stale 用、后台立刻刷新），
+    名单给 `FOLLOW_UIDS_TTL`。
     """
     try:
         with open(FOLLOW_DISK, encoding="utf-8") as f:
@@ -4939,11 +5689,14 @@ def _follow_disk_save():
 
 
 def _follow_store(live):
-    """写缓存，并挡住「新结果比旧结果少一半以上」这种残缺覆盖。"""
-    old = FOLLOW_CACHE["list"]
-    if old and len(old) >= 4 and len(live) < len(old) / 2:
-        raise RuntimeError("新结果只有 %d 位在播（旧数据 %d 位），疑似上游残缺，保留旧数据"
-                           % (len(live), len(old)))
+    """写缓存。
+
+    ⚠️ **不要**再按「新结果比旧结果少一半」判残缺。在播人数从晚高峰到白天掉一半
+       是正常现象；这条启发式一旦误判，新的正确名单会被永远挡在门外，页面就一直
+       显示几小时前的那份（实测：88 → 36 被拒，20 小时后仍是 88，格子里 71 个
+       写着「未开播」）。完整性现在由 `_follow_live_fetch` 的「任一批失败即抛错」
+       保证，这里只负责落盘。
+    """
     with FOLLOW_LOCK:
         FOLLOW_CACHE["at"] = time.time()
         FOLLOW_CACHE["list"] = live
@@ -5001,9 +5754,19 @@ def api_following_live(force=False):
                      "age": int(now - FOLLOW_CACHE["at"]), "refreshing": busy}
     if old and force and FOLLOW_CACHE["busy"]:
         # 已经在后台刷了：再同步跑一轮只会白打一遍接口（还可能招风控）
-        return 200, {"list": old, "cached": True, "stale": True, "refreshing": True}
+        return 200, {"list": old, "cached": True, "stale": True, "refreshing": True,
+                     "age": int(now - FOLLOW_CACHE["at"])}
     t0 = time.time()
-    live = _follow_live_fetch()
+    try:
+        live = _follow_live_fetch()
+    except Exception as e:
+        # 同步取失败：有旧数据就把它连同原因一起给前端（列表不清空、只标「刷新失败」），
+        # 没有旧数据才真的报错。以前这里直接抛 500，页面只剩一句「读取失败」。
+        if old:
+            return 200, {"list": old, "cached": True, "stale": True, "refreshing": False,
+                         "age": int(now - FOLLOW_CACHE["at"]),
+                         "error": "刷新失败：%s" % str(e)[:80]}
+        return 502, {"error": "读取关注列表失败：%s" % str(e)[:100]}
     _follow_store(live)
     ms = int((time.time() - t0) * 1000)
     print("[follow] 取到 %d 位在播，耗时 %d ms" % (len(live), ms))
@@ -7080,8 +7843,23 @@ def _chat_parse_nested(sid, payload):
                 if cmd.startswith("DANMU_MSG") and j.get("info"):
                     info = j["info"]
                     who = info[2] or []
-                    _chat_broadcast(sid, {"type": "danmaku", "uid": who[0] or 0,
-                                          "uname": who[1] or "", "text": info[1] or ""})
+                    payload = {"type": "danmaku", "uid": who[0] or 0,
+                               "uname": who[1] or "", "text": info[1] or ""}
+                    # info[0][13] 是表情弹幕的元数据（{} 表示普通弹幕）。
+                    # 只放行 hdslb 的图，别把任意 url 交给前端去加载。
+                    try:
+                        raw = info[0][13] if len(info[0]) > 13 else None
+                        if isinstance(raw, dict) and raw.get("emoticon_unique"):
+                            u = str(raw.get("url") or "").replace("http://", "https://")
+                            if u.startswith("https://") and "hdslb.com" in u:
+                                payload["emoticon"] = {
+                                    "unique": str(raw.get("emoticon_unique")),
+                                    "url": u,
+                                    "w": int(raw.get("width") or 0),
+                                    "h": int(raw.get("height") or 0)}
+                    except Exception:
+                        pass
+                    _chat_broadcast(sid, payload)
             except Exception:
                 pass
         off += ln
@@ -9039,6 +9817,12 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(*page_alive(q.get("cid", [""])[0] or "anon"))
         if parsed.path == "/api/live/wheel":
             return self._json(*api_live_wheel_status())
+        if parsed.path == "/api/live/brief":
+            return self._json(*api_live_brief())
+        if parsed.path == "/api/live/emoticons":
+            return self._json(*api_live_emoticons("refresh" in q))
+        if parsed.path == "/api/feedback/conf":
+            return self._json(*api_feedback_conf())
         if parsed.path == "/api/live/playinfo":
             return self._json(*api_live_playinfo(q))
         if parsed.path == "/api/live/resolve":
@@ -9181,6 +9965,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(400, {"error": "本机没找到 ffmpeg，无法做分段"})
             queued = segments_enqueue(bvid, _find_program(bvid))
             return self._json(200, {"ok": True, "queued": queued})
+        if parsed.path == "/api/feedback":
+            return self._json(*api_feedback(obj))
+        if parsed.path == "/api/feedback/upload":
+            return self._json(*api_feedback_upload(obj))
+        if parsed.path == "/api/feedback/reveal":
+            return self._json(*api_feedback_reveal(obj))
         if parsed.path == "/api/live/send":
             return self._json(*api_live_send(obj))
         if parsed.path == "/api/live/wheel/start":

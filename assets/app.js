@@ -5,6 +5,25 @@
 (function () {
   'use strict';
 
+  /* ---------- 前端错误采集（只留在内存里，随反馈一起提交） ----------
+     只收「消息 + 文件基名 + 行号」，不收完整 URL、不带请求体。
+     反馈提交时最多带最近 5 条。 */
+  window.__ERR = window.__ERR || [];
+  function __pushErr(txt) {
+    try {
+      window.__ERR.push(String(txt).slice(0, 300));
+      while (window.__ERR.length > 20) window.__ERR.shift();
+    } catch (e) { /* 忽略 */ }
+  }
+  window.addEventListener('error', function (e) {
+    var f = String((e && e.filename) || '').split('/').pop();
+    __pushErr((e && e.message ? e.message : 'script error') + (f ? ' @' + f + ':' + (e.lineno || 0) : ''));
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e && e.reason;
+    __pushErr('未处理的 Promise：' + ((r && (r.message || r)) || 'unknown'));
+  });
+
   var CFG = {
     epoch: Date.parse('2026-09-25T00:00:00+08:00') / 1000,
     seed: 20260925,
@@ -674,6 +693,23 @@
      因为它必须在**每次**进入设置页时都跑一遍 —— 之前把填充塞在这里，
      靠 bindSettings() 的「只绑一次」守卫顺带执行，结果只要有一次抢在前面
      （元素还没就绪 / 标签还没渲染），下拉就永远空着（打包版实测踩到）。 */
+  /* 主播选择方式（外观卡里）：只影响顶栏那颗选择器，不需要重载页面 */
+  function syncLampModeUI() {
+    var sel = document.getElementById('set-lamp-mode');
+    if (sel) sel.value = lampMode();
+  }
+
+  function bindLampMode() {
+    var sel = document.getElementById('set-lamp-mode');
+    if (!sel || sel.getAttribute('data-bound') === '1') return;
+    sel.setAttribute('data-bound', '1');
+    sel.addEventListener('change', function () {
+      store.set(LAMP_MODE_KEY, sel.value);
+      closeLampPanel();
+      renderLamps(false);
+    });
+  }
+
   function bindDefaultView() {
     var sel = document.getElementById('set-default-view');
     if (!sel) return;
@@ -3107,7 +3143,168 @@
     applyPlayer(true);
   }
 
+  /* ---------------- 直播间表情面板 ----------------
+     数据来自 /api/live/emoticons（后端代取 GetEmoticons + 本地可替换包）。
+     点表情 = 直接发送：B 站表情弹幕必须走 dm_type=1 的专用参数，
+     当普通文字插进输入框再发送只会变成一串文字。 */
+  var EMO = { packs: [], active: 0, loaded: false, busy: false, err: '' };
+
+  function emojiPanelEl() { return document.getElementById('emoji-panel'); }
+
+  function emojiRender() {
+    var p = emojiPanelEl();
+    if (!p) return;
+    if (!EMO.packs.length) {
+      p.innerHTML = '<div class="ep-empty">' + esc(EMO.err || '正在读取表情…') + '</div>';
+      return;
+    }
+    var pk = EMO.packs[EMO.active] || EMO.packs[0];
+    var tabs = EMO.packs.map(function (x, i) {
+      return '<button class="ep-tab' + (i === EMO.active ? ' on' : '') + '"'
+        + ' data-ep-tab="' + i + '" type="button" role="tab"'
+        + ' aria-selected="' + (i === EMO.active ? 'true' : 'false') + '">'
+        + esc(x.name || ('表情 ' + (i + 1))) + '</button>';
+    }).join('');
+    var grid = pk.items.map(function (it) {
+      var lock = (it.need_level > 0 || it.need_gift > 0);
+      var need = lock ? (it.unlock || '需粉丝团') + (it.need_level ? ' ' + it.need_level + ' 级' : '') : '';
+      return '<button class="ep-item' + (lock ? ' locked' : '') + '" type="button"'
+        + ' data-ep-u="' + esc(it.u) + '" data-ep-name="' + esc(it.name || '') + '"'
+        + ' data-ep-url="' + esc(it.url) + '" data-ep-w="' + (it.w || 0) + '"'
+        + ' data-ep-h="' + (it.h || 0) + '" data-ep-bulge="' + (it.bulge || 0) + '"'
+        + ' data-ep-need="' + esc(need) + '"'
+        + ' title="' + esc((it.name || it.u) + (need ? '（' + need + '）' : '') + ' · 点击发送') + '">'
+        + '<img src="' + esc(dynImg(it.url)) + '" alt="' + esc(it.name || '') + '" loading="lazy">' 
+        + (lock ? '<i class="ep-lock">' + esc(it.unlock || '锁') + '</i>' : '')
+        + '</button>';
+    }).join('');
+    p.innerHTML = '<div class="ep-tabs" role="tablist">' + tabs + '</div>'
+      + '<div class="ep-body"><div class="ep-grid">' + grid + '</div></div>'
+      + '<div class="ep-foot"><img class="ep-prev" alt="" hidden>'
+      + '<span class="ep-meta"><b>悬停预览</b><span>点击表情直接发到当前直播间</span></span>'
+      + '<span class="ep-state"></span></div>';
+  }
+
+  function emojiPreview(item) {
+    var p = emojiPanelEl();
+    if (!p) return;
+    var img = p.querySelector('.ep-prev');
+    var meta = p.querySelector('.ep-meta');
+    if (!item) {
+      if (img) img.hidden = true;
+      if (meta) meta.innerHTML = '<b>悬停预览</b><span>点击表情直接发到当前直播间</span>';
+      return;
+    }
+    if (img) { img.src = dynImg(item.getAttribute('data-ep-url')); img.hidden = false; }
+    var need = item.getAttribute('data-ep-need');
+    if (meta) {
+      meta.innerHTML = '<b>' + esc(item.getAttribute('data-ep-name') || '表情') + '</b>'
+        + '<span>' + (need ? esc(need) + ' · 点击尝试发送' : '点击发送') + '</span>';
+    }
+  }
+
+  function emojiLoad(force) {
+    EMO.loaded = false;
+    EMO.err = '';
+    emojiRender();
+    fetch('/api/live/emoticons' + (force ? '?refresh=1' : ''))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        EMO.loaded = true;
+        EMO.packs = ((d && d.packs) || []).filter(function (x) { return x.items && x.items.length; });
+        EMO.active = 0;
+        EMO.err = (d && d.error) || (EMO.packs.length ? '' : '没有取到表情，点这里重试');
+        emojiRender();
+      })
+      .catch(function () {
+        EMO.loaded = true;
+        EMO.err = '表情加载失败，点这里重试';
+        emojiRender();
+      });
+  }
+
+  function emojiClose() {
+    var p = emojiPanelEl();
+    var b = document.getElementById('live-emoji');
+    if (p) p.hidden = true;
+    if (b) b.setAttribute('aria-expanded', 'false');
+  }
+
+  function emojiToggle() {
+    var p = emojiPanelEl();
+    var b = document.getElementById('live-emoji');
+    if (!p || !b) return;
+    if (!p.hidden) { emojiClose(); return; }
+    var r = b.getBoundingClientRect();
+    var w = Math.min(468, window.innerWidth - 20);
+    p.hidden = false;
+    p.style.width = w + 'px';
+    p.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+    p.style.top = '0px';
+    var h = p.getBoundingClientRect().height || 320;
+    p.style.top = Math.max(8, r.top - h - 8) + 'px';
+    b.setAttribute('aria-expanded', 'true');
+    if (!EMO.loaded) emojiLoad(false);
+  }
+
+  function emojiSend(item) {
+    if (EMO.busy || !item) return;
+    var p = emojiPanelEl();
+    var stEl = p && p.querySelector('.ep-state');
+    var need = item.getAttribute('data-ep-need');
+    EMO.busy = true;
+    if (stEl) stEl.textContent = '发送中…';
+    postJSON('/api/live/send', { emoticon: {
+      unique: item.getAttribute('data-ep-u'),
+      url: item.getAttribute('data-ep-url'),
+      w: +item.getAttribute('data-ep-w') || 0,
+      h: +item.getAttribute('data-ep-h') || 0,
+      bulge: +item.getAttribute('data-ep-bulge') || 0
+    } }).then(function (d) {
+      var ok = d && !d.error && d.code === 0;
+      var msg = ok ? '已发送 ✓'
+        : ((d && d.error) || ('B 站返回：' + ((d && d.message) || (d && d.code))));
+      if (stEl) stEl.textContent = need ? (msg + '（' + need + '）') : msg;
+      if (el.liveResult) el.liveResult.textContent = ok ? '已发送表情' : msg;
+    }).catch(function () {
+      if (stEl) stEl.textContent = '发送失败';
+    }).then(function () { EMO.busy = false; });
+  }
+
+  function bindLiveEmoji() {
+    var b = document.getElementById('live-emoji');
+    var p = emojiPanelEl();
+    if (!b || !p || b.getAttribute('data-bound') === '1') return;
+    b.setAttribute('data-bound', '1');
+    b.addEventListener('click', function (e) { e.stopPropagation(); emojiToggle(); });
+    p.addEventListener('click', function (e) {
+      var t = e.target.closest ? e.target.closest('[data-ep-tab]') : null;
+      if (t) { EMO.active = +t.getAttribute('data-ep-tab') || 0; emojiRender(); return; }
+      var it = e.target.closest ? e.target.closest('.ep-item') : null;
+      if (it) { emojiSend(it); return; }
+      if (e.target.closest && e.target.closest('.ep-empty')) emojiLoad(true);
+    });
+    p.addEventListener('mouseover', function (e) {
+      var it = e.target.closest ? e.target.closest('.ep-item') : null;
+      if (it) emojiPreview(it);
+    });
+    p.addEventListener('mouseleave', function () { emojiPreview(null); });
+    document.addEventListener('click', function (e) {
+      if (p.hidden) return;
+      /* ⚠️ 点分类会就地重建 innerHTML，事件冒到这里时 target 已经脱离文档，
+         `p.contains(target)` 变成 false —— 于是「点分类」被当成「点外部」把面板关了。
+         用 isConnected 先挡掉这种已经失效的 target。 */
+      if (!e.target || e.target.isConnected === false) return;
+      if (p.contains(e.target) || b.contains(e.target)) return;
+      emojiClose();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') emojiClose();
+    });
+  }
+
   function bindLive() {
+    bindLiveEmoji();          // 表情面板（点上一次绑定，内部自己做委托）
     // 独轮车平时收着，点按钮才展开（浮层）；收起时按钮上会显示运行进度
     function showWheel(on) { el.wheelPop.hidden = !on; }
     el.wheelToggle.addEventListener('click', function () { showWheel(el.wheelPop.hidden); });
@@ -3290,7 +3487,7 @@
     chatLine(null, null, text, true);
   }
 
-  function chatLine(uid, uname, text, sys) {
+  function chatLine(uid, uname, text, sys, em) {
     var box = el.liveChat;
     if (!box) return;
     var div = document.createElement('div');
@@ -3302,7 +3499,19 @@
       u.textContent = uname + '：';
       div.appendChild(u);
     }
-    div.appendChild(document.createTextNode(text));
+    /* 表情弹幕：B 站把图放在 info[0][13]，服务端已经过滤成 hdslb 的 https 地址。
+       有图就只画图（文字就是表情名，再画一遍是重复）。 */
+    if (em && em.url) {
+      var im = document.createElement('img');
+      im.className = 'chat-em';
+      im.src = dynImg(em.url);      // 直连图床在部分网络会失败，统一走本机代理
+      im.alt = text || '表情';
+      im.title = text || '';
+      im.loading = 'lazy';
+      div.appendChild(im);
+    } else {
+      div.appendChild(document.createTextNode(text));
+    }
     var stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
     box.appendChild(div);
     while (box.children.length > 80) box.removeChild(box.firstChild);
@@ -3319,7 +3528,7 @@
     chatEs.onmessage = function (ev) {
       var j;
       try { j = JSON.parse(ev.data); } catch (e) { return; }
-      if (j.type === 'danmaku') chatLine(j.uid, j.uname, j.text);
+      if (j.type === 'danmaku') chatLine(j.uid, j.uname, j.text, false, j.emoticon);
       else if (j.type === 'popularity')
         el.liveChatState.textContent = '已连接 · 人气 ' + fmtNum(j.value);
       else if (j.type === 'state') chatSys(j.text);
@@ -3447,6 +3656,8 @@
     if (keysBound) return;
     keysBound = true;
     bindDefaultView();
+    bindLampMode();
+    bindFeedback();
 
     // 主播管理：填 UID → 检测 → 选来源 → 保存 / 删除
     var stProbeBtn = document.getElementById('st-probe');
@@ -4078,6 +4289,8 @@
   function renderSettings() {
     bindSettings();
     syncDefaultViewUI();        // 幂等：已经填过就直接返回（见 syncDefaultViewUI 里的守卫）
+    syncLampModeUI();
+    syncFeedbackUI();
     renderStationsCard();
     el.keysList.innerHTML = KEY_ACTIONS.map(function (a) {
       var c = keyMap[a.id];
@@ -4452,6 +4665,8 @@
 
   function setView(name) {
     if (VIEWS.indexOf(name) < 0) name = 'live';
+    closeLampPanel();          // 切页时浮层不要悬在半空（它挂在 header 外，不会随内容消失）
+    if (typeof emojiClose === 'function') emojiClose();
     var prev = state.view;
     /* 播放器只有一个：歌单要借走时间轴，直播间 / 监控室要抢走 <video>。
        去这几个页面之前先把录播看到的位置记下来（state.view 此刻还是旧值，
@@ -8813,6 +9028,311 @@
     });
   }
 
+  /* ---------------- 反馈与错误上报 ----------------
+     默认只写本机 data/feedback/feedback-YYYYMM.jsonl，不上传；
+     data/feedback.json 里配了 webhook 才会额外 POST 一份。
+     诊断信息只取白名单字段（版本/页面/UA/最近报错），不碰 SESSDATA、Cookie、完整路径。 */
+  var FB = { busy: false, meta: {}, shots: [], id: '', conf: { upload: true, target: '' } };
+  var FB_SHOT_MAX = 3;
+
+  function fbContext() {
+    return {
+      app: 'replay-radio',
+      version: FB.meta.version || '',
+      build: FB.meta.build || '',
+      view: state.view || '',
+      route: (location.hash || '').slice(0, 60),
+      station: ST_NAME || '',
+      theme: document.documentElement.getAttribute('data-theme') || 'dark',
+      lang: (document.getElementById('lang') || {}).value || '',
+      zoom: Math.round((window.outerWidth / Math.max(1, window.innerWidth)) * 100) + '%',
+      ua: navigator.userAgent,
+      platform: navigator.platform || '',
+      screen: screen.width + 'x' + screen.height + ' @' + (window.devicePixelRatio || 1) + 'x',
+      errors: (window.__ERR || []).slice(-5).map(function (x) { return String(x).slice(0, 200); })
+    };
+  }
+
+  function fbShotsRender() {
+    var box = document.getElementById('fb-shots');
+    var note = document.getElementById('fb-shots-note');
+    if (!box) return;
+    box.innerHTML = FB.shots.map(function (sh, i) {
+      return '<figure class="fb-shot"><img src="' + sh.data + '" alt="">'
+        + '<figcaption>' + esc(sh.name || ('截图 ' + (i + 1)))
+        + ' · ' + Math.max(1, Math.round((sh.data.length * 0.75) / 1024)) + ' KB</figcaption>'
+        + '<button type="button" class="fb-shot-x" data-shot="' + i
+        + '" title="移除这张截图">×</button></figure>';
+    }).join('');
+    if (note) {
+      note.textContent = FB.shots.length >= FB_SHOT_MAX
+        ? '最多 ' + FB_SHOT_MAX + ' 张（再添加请先移除一张）'
+        : '可直接 Ctrl+V 粘贴截图，还能加 ' + (FB_SHOT_MAX - FB.shots.length) + ' 张';
+    }
+  }
+
+  /* 截图先在本机压到最长边 1400、JPEG 0.82 再传：原图动辄 3~5MB，
+     既撑爆请求体，也没必要为一张截图传那么多像素。 */
+  function fbAddFiles(files) {
+    var out = document.getElementById('fb-result');
+    var list = Array.prototype.slice.call(files || []);
+    var room = FB_SHOT_MAX - FB.shots.length;
+    if (room <= 0) {
+      if (out) out.textContent = '最多 ' + FB_SHOT_MAX + ' 张截图，请先移除一张';
+      return;
+    }
+    list.slice(0, room).forEach(function (f) {
+      if (!f || !/^image\//.test(f.type || '')) return;
+      var fr = new FileReader();
+      fr.onload = function () {
+        var img = new Image();
+        img.onload = function () {
+          var scale = Math.min(1, 1400 / Math.max(img.width, img.height));
+          var cv = document.createElement('canvas');
+          cv.width = Math.max(1, Math.round(img.width * scale));
+          cv.height = Math.max(1, Math.round(img.height * scale));
+          cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+          FB.shots.push({ name: (f.name || '截图').slice(0, 40),
+                          type: 'image/jpeg',
+                          data: cv.toDataURL('image/jpeg', 0.82) });
+          fbShotsRender();
+          fbPreview();
+        };
+        img.onerror = function () {
+          if (out) out.textContent = '这张图读不出来：' + (f.name || '');
+        };
+        img.src = fr.result;
+      };
+      fr.readAsDataURL(f);
+    });
+  }
+
+  function fbPayload() {
+    function val(id) {
+      var e = document.getElementById(id);
+      return ((e && e.value) || '').trim();
+    }
+    var kindEl = document.getElementById('fb-kind');
+    var ctxEl = document.getElementById('fb-ctx');
+    var upEl = document.getElementById('fb-upload');
+    return {
+      kind: (kindEl && kindEl.value) || 'bug',
+      text: val('fb-text'),
+      steps: val('fb-steps'),
+      trigger: val('fb-trigger'),
+      actual: val('fb-actual'),
+      expected: val('fb-expected'),
+      upload: !!(upEl && upEl.checked),
+      context: (ctxEl && ctxEl.checked) ? fbContext() : {},
+      images: FB.shots.map(function (sh) {
+        return { name: sh.name, type: sh.type, data: sh.data };
+      })
+    };
+  }
+
+  function fbPreview() {
+    var pre = document.getElementById('fb-preview');
+    var p = fbPayload();
+    var shown = {
+      kind: p.kind, summary: p.text, steps: p.steps, trigger: p.trigger,
+      actual: p.actual, expected: p.expected,
+      upload: p.upload, images: FB.shots.map(function (sh) { return sh.name; }),
+      context: p.context, note: '提交时后台会自动附上日志末尾（凭据已涂掉）'
+    };
+    if (pre) pre.textContent = JSON.stringify(shown, null, 2);
+    var gh = document.getElementById('fb-gh');
+    if (gh) {
+      var title = '[反馈] ' + (p.kind === 'bug' ? '问题' : p.kind === 'idea' ? '建议' : '其他')
+        + '：' + (p.text || '（无概述）');
+      var body = '### 概述\n' + (p.text || '（未填）')
+        + '\n\n### 复现步骤\n' + (p.steps || '（未填）')
+        + '\n\n### 触发条件\n' + (p.trigger || '（未填）')
+        + '\n\n### 异常表现\n' + (p.actual || '（未填）')
+        + '\n\n### 期望结果\n' + (p.expected || '（未填）')
+        + '\n\n### 环境\n```json\n' + JSON.stringify(p.context, null, 2) + '\n```';
+      gh.href = 'https://github.com/DcC176/replay-radio/issues/new?title='
+        + encodeURIComponent(title.slice(0, 120))
+        + '&body=' + encodeURIComponent(body.slice(0, 6000));
+    }
+  }
+
+  function fbCopy() {
+    var out = document.getElementById('fb-result');
+    var p = fbPayload();
+    var txt = '【' + (p.kind === 'bug' ? '问题 / 错误' : p.kind === 'idea' ? '功能建议' : '其他') + '】'
+      + (p.text || '') + '\n\n复现步骤：\n' + (p.steps || '（未填）')
+      + '\n\n触发条件：' + (p.trigger || '（未填）')
+      + '\n异常表现：' + (p.actual || '（未填）')
+      + '\n期望结果：' + (p.expected || '（未填）')
+      + '\n\n--- 诊断信息 ---\n' + JSON.stringify(p.context, null, 2);
+    function done(ok) {
+      if (out) out.textContent = ok ? '已复制到剪贴板' : '复制失败，请手动选中预览里的内容';
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(function () { done(true); },
+        function () { done(false); });
+      return;
+    }
+    done(false);
+  }
+
+  function fbSetButtons() {
+    var re = document.getElementById('fb-reupload');
+    var op = document.getElementById('fb-open');
+    if (re) re.hidden = !FB.id;
+    if (op) op.hidden = !FB.id;
+  }
+
+  function fbReset() {
+    ['fb-text', 'fb-steps', 'fb-trigger', 'fb-actual', 'fb-expected'].forEach(function (id) {
+      var e = document.getElementById(id);
+      if (e) e.value = '';
+    });
+    FB.shots = [];
+    fbShotsRender();
+    fbPreview();
+  }
+
+  function fbSubmit() {
+    if (FB.busy) return;
+    var out = document.getElementById('fb-result');
+    var p = fbPayload();
+    if ((p.text + p.steps + p.actual).length < 4) {
+      if (out) out.textContent = '请至少写一句概述，或填一下现象 / 复现步骤';
+      return;
+    }
+    FB.busy = true;
+    if (out) out.textContent = p.upload ? '正在提交并上传…' : '正在提交…';
+    postJSON('/api/feedback', p).then(function (d) {
+      if (!d || d.error) {
+        if (out) out.textContent = '提交失败：' + ((d && d.error) || '未知原因');
+        return;
+      }
+      FB.id = d.id || '';
+      fbSetButtons();
+      var msg = '已提交 · 编号 ' + d.id + ' · ';
+      if (d.upload && d.upload.ok) {
+        msg += '已上传到 ' + (d.upload.target || '收集地址')
+          + (d.upload.images ? '（含截图 ' + d.upload.images + ' 张）' : '');
+      } else if (d.upload) {
+        msg += '本机已保存（' + d.stored + '），上传失败：'
+          + (d.upload.error || '对方未接受') + '。可点「一键上传」重试。';
+      } else {
+        msg += '本机已保存（' + d.stored + '）'
+          + (d.reveal && d.reveal.ok ? '，已打开保存文件夹' : '');
+      }
+      if (out) out.textContent = msg;
+      fbReset();
+    }).catch(function () {
+      if (out) out.textContent = '提交失败：没有连上本机服务';
+    }).then(function () { FB.busy = false; });
+  }
+
+  function fbReupload() {
+    if (!FB.id || FB.busy) return;
+    var out = document.getElementById('fb-result');
+    FB.busy = true;
+    if (out) out.textContent = '正在重新上传 ' + FB.id + '…';
+    postJSON('/api/feedback/upload', { id: FB.id }).then(function (d) {
+      if (out) {
+        out.textContent = (d && d.ok)
+          ? '已上传到 ' + (d.target || '收集地址')
+          : ('上传仍失败：' + ((d && (d.error || d.message)) || '未知原因'));
+      }
+    }).catch(function () {
+      if (out) out.textContent = '上传失败：没有连上本机服务';
+    }).then(function () { FB.busy = false; });
+  }
+
+  function fbOpen() {
+    var out = document.getElementById('fb-result');
+    postJSON('/api/feedback/reveal', { id: FB.id }).then(function (d) {
+      if (out) {
+        out.textContent = (d && d.ok)
+          ? '已在资源管理器中打开：' + (d.path || 'data/feedback')
+          : ('打不开文件夹：' + ((d && d.error) || '') + ' 手动位置：' + ((d && d.path) || 'data/feedback'));
+      }
+    }).catch(function () {
+      if (out) out.textContent = '打不开文件夹：没有连上本机服务';
+    });
+  }
+
+  function bindFeedback() {
+    var sub = document.getElementById('fb-submit');
+    if (!sub || sub.getAttribute('data-bound') === '1') return;
+    sub.setAttribute('data-bound', '1');
+    ['fb-kind', 'fb-text', 'fb-steps', 'fb-trigger', 'fb-actual', 'fb-expected',
+     'fb-ctx', 'fb-upload'].forEach(function (id) {
+      var e = document.getElementById(id);
+      if (!e) return;
+      e.addEventListener('input', fbPreview);
+      e.addEventListener('change', fbPreview);
+    });
+    sub.addEventListener('click', fbSubmit);
+    var cp = document.getElementById('fb-copy');
+    if (cp) cp.addEventListener('click', fbCopy);
+    var re = document.getElementById('fb-reupload');
+    if (re) re.addEventListener('click', fbReupload);
+    var op = document.getElementById('fb-open');
+    if (op) op.addEventListener('click', fbOpen);
+
+    var pick = document.getElementById('fb-pick');
+    var file = document.getElementById('fb-file');
+    if (pick && file) {
+      pick.addEventListener('click', function () { file.click(); });
+      file.addEventListener('change', function () {
+        fbAddFiles(file.files);
+        file.value = '';
+      });
+    }
+    var shots = document.getElementById('fb-shots');
+    if (shots) shots.addEventListener('click', function (e) {
+      var x = e.target.closest ? e.target.closest('[data-shot]') : null;
+      if (!x) return;
+      FB.shots.splice(+x.getAttribute('data-shot') || 0, 1);
+      fbShotsRender();
+      fbPreview();
+    });
+    /* 粘贴截图：只在设置页、且焦点不在别的输入框里时接管，
+       否则会把用户粘贴到输入框的文字也当图片处理。 */
+    document.addEventListener('paste', function (e) {
+      if (state.view !== 'settings') return;
+      var items = (e.clipboardData && e.clipboardData.items) || [];
+      var imgs = [];
+      for (var i = 0; i < items.length; i++) {
+        if (items[i].type && items[i].type.indexOf('image/') === 0) {
+          var f = items[i].getAsFile();
+          if (f) imgs.push(f);
+        }
+      }
+      if (!imgs.length) return;
+      e.preventDefault();
+      fbAddFiles(imgs);
+    });
+    fbShotsRender();
+    fbSetButtons();
+  }
+
+  function syncFeedbackUI() {
+    fbPreview();
+    fetch('/api/ping').then(function (r) { return r.json(); }).then(function (d) {
+      FB.meta = { version: (d && d.version) || '', build: (d && d.build) || '' };
+      fbPreview();
+    }).catch(function () { /* 服务不在：版本留空 */ });
+    fetch('/api/feedback/conf').then(function (r) { return r.json(); }).then(function (d) {
+      if (!d) return;
+      FB.conf = d;
+      var up = document.getElementById('fb-upload');
+      if (up) up.checked = !!d.upload;      // 默认值以服务端为准（可在 data/feedback.json 关掉）
+      var t = document.getElementById('fb-target');
+      if (t) {
+        t.textContent = d.upload
+          ? '（' + (d.target || '开发者收集地址') + '；关掉则只存本机并弹出文件夹）'
+          : '（当前已关闭上传，提交后只存本机）';
+      }
+    }).catch(function () { /* 配置取不到：保持默认勾选 */ });
+  }
+
   function bindUpdate() {
     var check = document.getElementById('btn-update-check');
     if (check) check.addEventListener('click', function () { updCheck(true); });
@@ -9514,28 +10034,263 @@
     return out;
   }
 
+  /* 主播选择：三种形态，都靠一个**固定定位**的浮层展开，不占顶栏宽度。
+       · hover（默认）：≤8 位直接排灯；超过 8 位只留前 3 个 + 「+N」，悬停展开完整灯条
+       · select：顶栏一个「主播 N/M」按钮，点开纵向名单
+       · popover：顶栏显示已选的主播点 + 计数，悬停展开带头像/名字的卡片墙
+     ⚠️ 浮层必须挂在 header 外面并且 position:fixed —— 放在顶栏里会被标签条按绘制
+        顺序盖住（同一个坑在「更多」菜单上踩过）。 */
+  var LAMP_MODE_KEY = 'xl_lamp_mode';
+  /* 默认最多直接排 7 个灯（用户要求）；第 8 位起收进浮层。
+     7 个灯 ≈ 170px，配合下面 .station-lamps 的紧凑间距仍能塞进 1400+ 的单行顶栏。 */
+  var LAMP_COLLAPSE_AT = 7;
+  var LAMP_INLINE_KEEP = 7;        // 收起时顶栏仍保留几个灯
+  var lampHoverTimer = 0;
+  var lampBrief = { key: '', at: 0, data: null, seq: 0 };
+  var LAMP_BRIEF_TTL = 45000;      // 顶栏那行「直播中 · 标题」的新鲜度
+
+  function lampMode() {
+    var m = store.get(LAMP_MODE_KEY, 'hover');
+    return (m === 'select' || m === 'popover') ? m : 'hover';
+  }
+
+  function lampCollapsed() {
+    var m = lampMode();
+    if (m === 'select' || m === 'popover') return true;
+    return (STATIONS || []).length > LAMP_COLLAPSE_AT;
+  }
+
+  function lampBtn(s, on) {
+    var name = (s.short || s.name) + (s.main ? '（主站）' : '');
+    var hint = on
+      ? ' · 左键取消混合 · 右键只看这一位'
+      : ' · 左键加入混合 · 右键只看这一位';
+    var accent = s.accent || '#8a8a95';
+    return '<button type="button" class="lamp' + (on ? ' on' : '') + '"'
+      + ' data-id="' + esc(s.id) + '"'
+      + ' style="--lc:' + esc(accent) + ';--lcd:' + esc(dimHex(accent, 0.26)) + '"'
+      + ' aria-pressed="' + (on ? 'true' : 'false') + '"'
+      + ' aria-label="' + esc(name + hint) + '"'
+      + ' title="' + esc(name + hint) + '"></button>';
+  }
+
   function renderLamps(live) {
     var box = document.getElementById('station-lamps');
     if (!box) return;
-    box.innerHTML = STATIONS.map(function (s) {
-      var on = ST_SET.indexOf(s.id) >= 0;
-      var name = (s.short || s.name) + (s.main ? '（主站）' : '');
-      var hint = on
-        ? ' · 左键取消混合 · 右键只看这一位'
-        : ' · 左键加入混合 · 右键只看这一位';
-      var accent = s.accent || '#8a8a95';
-      return '<button type="button" class="lamp' + (on ? ' on' : '') + '"'
-        + ' data-id="' + esc(s.id) + '"'
-        + ' style="--lc:' + esc(accent) + ';--lcd:' + esc(dimHex(accent, 0.26)) + '"'
-        + ' aria-pressed="' + (on ? 'true' : 'false') + '"'
-        + ' aria-label="' + esc(name + hint) + '"'
-        + ' title="' + esc(name + hint) + '"></button>';
-    }).join('');
+    var list = STATIONS || [];
+    var mode = lampMode();
+    if (!lampCollapsed()) {
+      box.innerHTML = list.map(function (s) {
+        return lampBtn(s, ST_SET.indexOf(s.id) >= 0);
+      }).join('');
+    } else if (mode === 'hover') {
+      var rest = list.length - LAMP_INLINE_KEEP;
+      box.innerHTML = list.slice(0, LAMP_INLINE_KEEP).map(function (s) {
+        return lampBtn(s, ST_SET.indexOf(s.id) >= 0);
+      }).join('')
+        + '<button type="button" class="lamp-more" data-lamp-open="1"'
+        + ' aria-haspopup="true" aria-expanded="false"'
+        + ' title="还有 ' + rest + ' 位主播：悬停或点击查看全部">+' + rest + '</button>';
+    } else {
+      var onN = list.filter(function (s) { return ST_SET.indexOf(s.id) >= 0; }).length;
+      /* 触发条直接给「当前主播是谁」：头像 + 名字 + 一行直播状态/标题。
+         以前只有「主播 2/7 ▾」，单看数字根本不知道自己在看谁 —— 必须点开才知道。 */
+      var cur = findStation(ST) || list[0] || {};
+      var accent = cur.accent || '#8a8a95';
+      var nm = cur.name || cur.short || cur.id || '未选择';
+      box.innerHTML = '<button type="button" class="lamp-trigger" data-lamp-open="1"'
+        + ' aria-haspopup="true" aria-expanded="false"'
+        + ' style="--lc:' + esc(accent) + '"'
+        + ' title="' + esc(nm + ' · 点击切换要观看的主播（可多选）') + '">'
+        + '<span class="lt-ava">' + faceHtml(cur.face, 'lt-ava-img', nm) + '</span>'
+        + '<span class="lt-body">'
+        + '<b class="lt-name">' + esc(nm) + (cur.main ? '<i class="lt-main">主站</i>' : '') + '</b>'
+        + '<i class="lt-sub">读取直播状态…</i></span>'
+        + '<span class="lt-count" title="已点亮 / 全部主播">' + onN + '/' + list.length + '</span>'
+        + '<span class="lt-caret" aria-hidden="true">▾</span></button>';
+    }
+    /* select / popover 收起态只有一颗按钮：别让它套在「灯条外壳」里 */
+    box.classList.toggle('is-plain', lampCollapsed() && mode !== 'hover');
     // 主位在播时给它的灯加一圈绿边（原来的小圆点就是这个作用）
     if (live) {
       var b = box.querySelector('[data-id="' + ST + '"]');
       if (b) b.classList.add('living');
     }
+    bindFaceFallback(box);
+    lampFillBrief();
+    if (lampPanelIsOpen()) renderLampPanel();   // 开着的时候跟上选择状态
+  }
+
+  /* 顶栏触发条的第二行：直播中 + 标题 / 未开播。走 /api/live/brief（30 秒缓存），
+     不碰状态面板那套重接口；失败只写「状态未知」，不弹错、不重试刷屏。 */
+  function lampFillBrief() {
+    var box = document.getElementById('station-lamps');
+    if (!box) return;
+    var sub = box.querySelector('.lt-sub');
+    if (!sub) return;
+    var cur = findStation(ST);
+    if (!cur) { sub.textContent = '未选择主播'; return; }
+    var key = cur.id + '@' + (cur.room || '');
+
+    function paint(d) {
+      if (!sub.isConnected) return;
+      if (!d) { sub.textContent = '直播状态未知'; return; }
+      if (d.error && !d.living) { sub.textContent = '状态未知 · 点击选择主播'; return; }
+      if (d.living) {
+        sub.textContent = '直播中' + (d.title ? ' · ' + d.title : '');
+        sub.classList.add('on');
+      } else {
+        sub.textContent = '未开播';      // 房间号对用户没用，选择结果也不依赖它
+        sub.classList.remove('on');
+      }
+      sub.title = d.living ? (d.title || '直播中') : '当前未开播';
+    }
+
+    if (lampBrief.key === key && lampBrief.data) paint(lampBrief.data);
+    if (lampBrief.key === key && Date.now() - lampBrief.at < LAMP_BRIEF_TTL) return;
+    var seq = ++lampBrief.seq;
+    fetch('/api/live/brief?station=' + encodeURIComponent(cur.id))
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (seq !== lampBrief.seq) return;         // 晚回来的旧响应不许覆盖
+        lampBrief = { key: key, at: Date.now(), data: d || null, seq: seq };
+        paint(d || null);
+      })
+      .catch(function () {
+        if (seq === lampBrief.seq) paint(null);
+      });
+  }
+
+  function lampPanelEl() { return document.getElementById('lamp-panel'); }
+  function lampPanelIsOpen() {
+    var p = lampPanelEl();
+    return !!(p && !p.hidden);
+  }
+
+  function renderLampPanel() {
+    var p = lampPanelEl();
+    if (!p) return;
+    var list = STATIONS || [];
+    var mode = lampMode();
+    if (!list.length || !lampCollapsed()) { p.hidden = true; return; }
+    var title = '<div class="lp-title">点亮谁就看谁（可多选，右键只看这一位）</div>';
+    var body;
+    if (mode === 'select') {
+      body = title + '<div class="lp-list">' + list.map(function (s) {
+        var on = ST_SET.indexOf(s.id) >= 0;
+        return '<button type="button" class="lp-row' + (on ? ' on' : '') + '"'
+          + ' data-id="' + esc(s.id) + '" role="menuitemcheckbox"'
+          + ' aria-checked="' + (on ? 'true' : 'false') + '">'
+          + '<i class="lp-dot" style="--lc:' + esc(s.accent || '#8a8a95') + '"></i>'
+          + '<span class="lp-name">' + esc(s.name || s.id) + '</span>'
+          + (s.main ? '<span class="lp-badge">主站</span>' : '')
+          + '<span class="lp-check" aria-hidden="true">' + (on ? '✓' : '') + '</span>'
+          + '</button>';
+      }).join('') + '</div>';
+    } else if (mode === 'popover') {
+      body = title + '<div class="lp-cards">' + list.map(function (s) {
+        var on = ST_SET.indexOf(s.id) >= 0;
+        return '<button type="button" class="lp-card' + (on ? ' on' : '') + '"'
+          + ' data-id="' + esc(s.id) + '" aria-pressed="' + (on ? 'true' : 'false') + '">'
+          + '<span class="lp-ava">' + faceHtml(s.face, 'lp-ava-img', s.name || s.id) + '</span>'
+          + '<b>' + esc(s.short || s.name || s.id) + '</b>'
+          + (s.main ? '<em>主站</em>' : '')
+          + '<i class="lp-check" aria-hidden="true">' + (on ? '✓' : '') + '</i></button>';
+      }).join('') + '</div>';
+    } else {
+      body = title + '<div class="lp-lamps">' + list.map(function (s) {
+        return lampBtn(s, ST_SET.indexOf(s.id) >= 0);
+      }).join('') + '</div>';
+    }
+    p.className = 'lamp-panel'
+      + (mode === 'select' ? ' is-list' : mode === 'popover' ? ' is-cards' : '');
+    p.innerHTML = body;
+    bindFaceFallback(p);
+  }
+
+  function openLampPanel() {
+    var p = lampPanelEl();
+    var dock = document.getElementById('lamp-dock');
+    if (!p || !dock || !lampCollapsed()) return;
+    renderLampPanel();
+    var r = dock.getBoundingClientRect();
+    var bar = document.querySelector('.topbar');
+    /* 灯条是垂直居中的，它的底边比顶栏底边还高几个像素 —— 直接贴 r.bottom
+       会压住顶栏那 1~2px 的边框。取两者的较大值，保证浮层整体在顶栏下方。 */
+    var floor = bar ? bar.getBoundingClientRect().bottom : r.bottom;
+    p.hidden = false;
+    p.style.top = Math.round(Math.max(r.bottom, floor) + 8) + 'px';
+    p.style.right = Math.max(10, Math.round(window.innerWidth - r.right)) + 'px';
+    var btn = dock.querySelector('[data-lamp-open]');
+    if (btn) btn.setAttribute('aria-expanded', 'true');
+  }
+
+  function closeLampPanel() {
+    var p = lampPanelEl();
+    var dock = document.getElementById('lamp-dock');
+    if (!p || p.hidden) return;
+    p.hidden = true;
+    var btn = dock && dock.querySelector('[data-lamp-open]');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+  }
+
+  /* 悬停展开 / 移开收起：两条延迟都要有 ——
+     立刻收起会让「从 +N 移到面板」这一小段空隙把面板关掉。 */
+  function bindLampPanel() {
+    var dock = document.getElementById('lamp-dock');
+    var p = lampPanelEl();
+    if (!dock || !p || dock.getAttribute('data-lamp-bound') === '1') return;
+    dock.setAttribute('data-lamp-bound', '1');
+    dock.addEventListener('mouseenter', function () {
+      if (!lampCollapsed()) return;
+      clearTimeout(lampHoverTimer);
+      lampHoverTimer = setTimeout(openLampPanel, 120);
+    });
+    dock.addEventListener('mouseleave', function () {
+      clearTimeout(lampHoverTimer);
+      lampHoverTimer = setTimeout(function () {
+        if (p.matches(':hover')) return;        // 鼠标已经移到面板上
+        closeLampPanel();
+      }, 200);
+    });
+    p.addEventListener('mouseenter', function () { clearTimeout(lampHoverTimer); });
+    p.addEventListener('mouseleave', function () {
+      clearTimeout(lampHoverTimer);
+      lampHoverTimer = setTimeout(closeLampPanel, 160);
+    });
+    /* 点 +N / 触发器 = 固定打开（触屏没有 hover）；点 .lamp 仍走原来的开关逻辑 */
+    dock.addEventListener('click', function (e) {
+      var t = e.target.closest ? e.target.closest('[data-lamp-open]') : null;
+      if (!t) return;
+      e.stopPropagation();
+      if (lampPanelIsOpen()) closeLampPanel(); else openLampPanel();
+    });
+    /* 面板里点谁就切谁（三种形态共用） */
+    p.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-id]') : null;
+      if (!b) return;
+      toggleStation(b.getAttribute('data-id'));
+    });
+    p.addEventListener('contextmenu', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-id]') : null;
+      if (!b) return;
+      e.preventDefault();
+      var id = b.getAttribute('data-id');
+      if (ST_SET.length === 1 && ST_SET[0] === id) return;
+      ST_SET = [id];
+      applyStationSet();
+    });
+    document.addEventListener('click', function (e) {
+      if (!lampPanelIsOpen()) return;
+      if (!e.target || e.target.isConnected === false) return;   // 同上：重渲染后的旧节点
+      if (p.contains(e.target) || dock.contains(e.target)) return;
+      closeLampPanel();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closeLampPanel();
+    });
+    window.addEventListener('scroll', closeLampPanel, { passive: true });
+    window.addEventListener('resize', closeLampPanel);
   }
 
   function toggleStation(id) {
@@ -9614,6 +10369,7 @@
       }
       renderLamps();
       renderMixedNote();
+      bindLampPanel();
       box.addEventListener('click', function (e) {
         var b = e.target && e.target.closest ? e.target.closest('.lamp') : null;
         if (b) toggleStation(b.getAttribute('data-id'));       // 左键：加入 / 退出混合
@@ -10457,6 +11213,8 @@
   var FREE_MIN_W = 14, FREE_MIN_H = 16;                     // 再小就看不清画面了
   var mfPickedKey = '';      // 墙上这批格子的指纹（mid@room）：没变就不重建，别把直播流断掉
   var mfReqSeq = 0;          // 关注列表请求序号：晚回来的旧响应不许覆盖新结果
+  var mfRetryN = 0;          // 旧数据（stale）的静默重试次数
+  var mfRetryTimer = 0;      // 已排队的重试（同时只允许一条）
 
   function mfAllList() {   // 左栏 = 手动添加的 + 关注列表里在播的（按 mid 去重，添加的在前）
     var seen = {};
@@ -11182,6 +11940,30 @@
     return true;
   }
 
+  /* 旧数据的静默重试：**必须有上限和退避**。
+     旧实现无脑 setTimeout 2.5 秒再来一次，而后端一旦刷新失败就会一直回 stale ——
+     页面于是每 2.5 秒重取一次、永远停不下来（用户看到的「反复自动刷新」）。
+     现在最多追 3 次（3 / 8 / 15 秒），仍失败就停在「数据为 N 分钟前，刷新失败」，
+     等用户点「刷新开播状态」再同步取。 */
+  function mfScheduleRetry(ageMin, n, auto) {
+    if (mfRetryTimer) return;                 // 已经排了一条，别叠加
+    if (!auto) return;                        // 后端已明确报错：等用户手动刷新
+    if (mfRetryN >= 3) {
+      if (state.view === 'multi' && multiSrc === 'following') {
+        mfNote(n + ' 位关注在播 · 数据为 ' + ageMin + ' 分钟前，刷新失败（可点「刷新开播状态」重试）');
+      }
+      return;
+    }
+    var wait = [3000, 8000, 15000][mfRetryN] || 15000;
+    mfRetryN += 1;
+    mfRetryTimer = setTimeout(function () {
+      mfRetryTimer = 0;
+      if (state.view === 'multi' && multiSrc === 'following') {
+        renderMultiFollowing(false, true);
+      }
+    }, wait);
+  }
+
   function renderMultiFollowing(force, quiet) {
     var side = document.getElementById('multi-side');
     var grid = document.getElementById('multi-grid');
@@ -11216,18 +11998,22 @@
         var list = res.j.list || [];
         mfApplyList(list);
         renderFollowGrid(true);      // 墙上的格子没变就不重建（见 renderFollowGrid 的 keepIfSame）
+        var ageMin = Math.max(1, Math.round((res.j.age || 0) / 60));
         if (!quiet) {
           mfNote(list.length + ' 位关注在播 · 点左侧加入监控墙（声音默认关）'
-            + (res.j.stale ? '　·　正在后台刷新…' : ''));
+            + (res.j.stale
+                ? ('　·　数据为 ' + ageMin + ' 分钟前，'
+                   + (res.j.error || '正在后台刷新…'))
+                : ''));
         }
         if (res.j.stale) {
-          // 后端给的是旧数据（>2 分钟）并已在后台刷新：2.5 秒后静默取一次新的。
-          // 刷新结果没变就什么都不做（不重渲染、不重建格子）。
-          setTimeout(function () {
-            if (state.view === 'multi' && multiSrc === 'following') {
-              renderMultiFollowing(false, true);
-            }
-          }, 2500);
+          /* 明确失败（不是后台还在刷）就别再自动追了：再自动重试只会继续失败，
+             把「刷新」留给用户点按钮，避免看起来像在不停刷新。 */
+          mfScheduleRetry(ageMin, list.length, !res.j.error || res.j.refreshing);
+        } else {
+          /* 拿到了新数据：把重试预算清回去，下一次旧数据还能再追三轮 */
+          mfRetryN = 0;
+          if (mfRetryTimer) { clearTimeout(mfRetryTimer); mfRetryTimer = 0; }
         }
       })
       .catch(function (e) {
