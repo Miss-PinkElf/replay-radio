@@ -1,10 +1,10 @@
 {
-  "version": "1.9.28",
-  "name": "ReplayRadio-v1.9.28.exe",
-  "size": 56237965,
-  "sha256": "06c3310c78e006de586022883ad1493c1239c5e43a901605d6da93c288942e6d",
-  "url": "https://github.com/DcC176/replay-radio/releases/download/v1.9.28/ReplayRadio-v1.9.28.exe",
-  "published": "2026-11-23T16:00:59Z",
-  "notes": "反馈合并为单一自包含 JSON（自动迁移旧文件）+ 主播选择器去掉房间号",
+  "version": "1.9.30",
+  "name": "ReplayRadio-v1.9.30.exe",
+  "size": 56241160,
+  "sha256": "8aae241467be8cccc0c6bc2efb4b471f7d9df0b6895bbd0d78c59d9609446318",
+  "url": "https://github.com/DcC176/replay-radio/releases/download/v1.9.30/ReplayRadio-v1.9.30.exe",
+  "published": "2026-11-24T05:49:56Z",
+  "notes": "启动发现新版本时展示完整更新公告（版本/时间/内容/操作）",
   "_note": "软件内更新检查的兜底数据源。发版时随 site/index.html 的 VERSION 一起改，发布到 gh-pages 后生效。"
 }
