@@ -1175,9 +1175,10 @@ def urlopen(req, timeout):
 # ---------------------------------------------------------------- 版本更新
 # 检查只请求 GitHub Releases API（失败再退官网 version.json）；下载与替换 EXE
 # 全部由用户点了「立即更新」之后才发生 —— 启动时绝不自动下载、安装或重启。
-APP_VERSION = "1.9.35"     # 与 build_exe.py:APP_VERSION / site/index.html:VERSION 同步
+APP_VERSION = "1.9.38"     # 与 build_exe.py:APP_VERSION / site/index.html:VERSION 同步
 UPDATE_REPO = "DcC176/replay-radio"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+UPDATE_LIST_API = "https://api.github.com/repos/%s/releases?per_page=20" % UPDATE_REPO
 UPDATE_SITE = "https://dcc176.github.io/replay-radio/version.json"
 UPDATE_TIMEOUT = 8         # 检查很短；下载单独给更长超时
 UPDATE_DIR = os.path.join(APPDIR, "updates")   # 下载的 EXE 与更新脚本都放这里
@@ -1204,6 +1205,24 @@ def _update_fetch_json(url, timeout=UPDATE_TIMEOUT):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+USER_NOTES_BEGIN = "<!-- USER_NOTES_BEGIN -->"
+USER_NOTES_END = "<!-- USER_NOTES_END -->"
+
+
+def _popup_notes(body):
+    """只取 Release 正文里给用户看的公告段。
+
+    v1.9.38 起生成的公告用标记包住用户语言段落；弹窗显示这一段，
+    技术细节留在 Release 页面。旧版本正文没有标记 → 退回全文，行为不变。
+    """
+    s = str(body or "").replace("\r\n", "\n")
+    if USER_NOTES_BEGIN in s and USER_NOTES_END in s:
+        inner = s.split(USER_NOTES_BEGIN, 1)[1].split(USER_NOTES_END, 1)[0]
+        if inner.strip():
+            return inner.strip()
+    return re.sub(r"<!--\s*USER_NOTES_(?:BEGIN|END)\s*-->", "", s).strip()
+
+
 def api_update_check():
     """GET /api/update/check —— 有新版才返回 available=true；不下载任何东西。"""
     cur = APP_VERSION
@@ -1221,14 +1240,39 @@ def api_update_check():
                     "name": exe.get("name") or "",
                     "size": int(exe.get("size") or 0),
                     "sha256": str((exe.get("digest") or "").replace("sha256:", "")),
-                    # 弹窗要展示完整公告：600 字经常正好截在关键条目上，放宽到 6000
-                    "notes": body[:6000],
+                    # 弹窗只显示标记里的用户公告（无标记时退回全文）
+                    "notes": _popup_notes(body)[:6000],
                     "notes_ok": bool(body),
                     "title": d.get("name") or rel,
                     "page": d.get("html_url") or
                             ("https://github.com/%s/releases/latest" % UPDATE_REPO),
                     "published": d.get("published_at") or ""}
             src = "github"
+            # 跨多个版本升级时，把「当前版本之后」的每个版本公告分别列出来。
+            # 原来只取 /releases/latest，落后 5 个版本的人也只能看到最新那一版。
+            try:
+                arr = _update_fetch_json(UPDATE_LIST_API)
+                blocks, vers = [], []
+                for r in (arr if isinstance(arr, list) else [])[:12]:
+                    tag = str(r.get("tag_name") or "").lstrip("vV")
+                    body = str(r.get("body") or "").replace("\r\n", "\n").strip()
+                    if not tag or not body:
+                        continue
+                    if _ver_tuple(tag) <= _ver_tuple(cur):
+                        continue
+                    # 公告正文自己带「## v1.9.35 · 日期」时去掉这一行，避免与下面拼的标题重复
+                    body = re.sub(r"^\s*#{1,4}\s*v?%s[^\n]*\n+" % re.escape(tag),
+                                  "", body, count=1, flags=re.I).strip()
+                    body = _popup_notes(body)
+                    if not body:
+                        continue
+                    blocks.append("## v%s\n\n%s" % (tag, body))
+                    vers.append(tag)
+                if blocks:
+                    data["notes"] = "\n\n".join(blocks)[:8000]
+                    data["versions"] = vers
+            except Exception:
+                pass
     except Exception:
         pass
     if not data:
@@ -5071,12 +5115,16 @@ def _live_emote_fetch(room):
     return packs
 
 
-def live_emote_packs(force=False):
-    """当前直播间的表情包（10 分钟缓存；失败时 30 秒后允许重试）。
+def live_emote_packs(force=False, room=None):
+    """**指定房间**的表情包（10 分钟缓存；失败时 30 秒后允许重试）。
+
+    room 为空才回落到当前主播的房间。监控室聚焦某一路时必须传那一路的 room：
+    表情包（尤其粉丝牌表情）是跟房间走的，拿主站主播的包去发别的房间，
+    轻则提示「不在表情包里」，重则发出去跟预期不一致。
 
     ⚠️ 失败不抛给前端：至少把本地包给出去，面板不该整块空掉。
     """
-    room = cur_room()
+    room = str(room or "").strip() or cur_room()
     now = time.time()
     with LIVE_EMOTE_LOCK:
         hit = LIVE_EMOTE.get(room)
@@ -5096,21 +5144,29 @@ def live_emote_packs(force=False):
     return out
 
 
-def api_live_emoticons(force=False):
-    d = live_emote_packs(force)
-    body = {"room": cur_room(), "packs": d["packs"],
+def api_live_emoticons(force=False, room=""):
+    room = str(room or "").strip()
+    d = live_emote_packs(force, room or None)
+    body = {"room": room or cur_room(), "packs": d["packs"],
             "source": "bili" if d["remote"] else ("local" if d["packs"] else "none")}
     if d["error"]:
         body["error"] = d["error"]
     return 200, body
 
 
-def _live_emote_find(unique):
-    """按 emoticon_unique 找表情（发之前必须校验：不能把任意 url 塞给 B 站）。"""
+def _live_emote_find(unique, room=""):
+    """按 emoticon_unique 找表情（发之前必须校验：不能把任意 url 塞给 B 站）。
+
+    先查目标房间的包，再查当前主播的包 —— 用户可能刚从「直播间」那边拿到的表情，
+    两个包内容一致时都能命中；不一致时以目标房间为准。
+    """
     u = str(unique or "").strip()
     if not u:
         return None
-    for p in live_emote_packs()["packs"]:
+    packs = list(live_emote_packs(room=room or None)["packs"])
+    if str(room or "").strip() and str(room).strip() != str(cur_room()):
+        packs += list(live_emote_packs()["packs"])
+    for p in packs:
         for it in p["items"]:
             if it["u"] != u:
                 continue
@@ -5173,7 +5229,7 @@ def api_live_send(obj):
     if em is not None:
         if not isinstance(em, dict):
             return 400, {"error": "表情参数不合法"}
-        item = _live_emote_find(em.get("unique"))
+        item = _live_emote_find(em.get("unique"), room)
         if not item:
             return 404, {"error": "这个表情不在当前直播间的表情包里（可能已下架或没有权限）"}
         if int(item.get("perm") or 0) != 1:
@@ -5507,14 +5563,18 @@ def _dedupe_uids(uids):
     return out
 
 
-def _following_uids():
+def _following_uids(force=False):
     """关注的全部 uid（半小时缓存；翻页并发跑）。
 
     页数由第一页的 `total` 决定，不再写死上限；单页失败会重试，
     仍失败则整体抛错（缺页 = 名单不完整，宁可沿用旧数据）。
+
+    force=True 时**跳过缓存**：用户点「刷新开播状态」就是要看当前真实关注关系。
+    以前这个函数没有 force，用户刚取消关注，uid 名单还能挂 30 分钟 ——
+    再配合下面按 uid 查开播状态，那个人会继续出现在「关注的直播」里。
     """
     now = time.time()
-    if FOLLOW_CACHE["uids"] and now - FOLLOW_CACHE["uids_at"] < FOLLOW_UIDS_TTL:
+    if not force and FOLLOW_CACHE["uids"] and now - FOLLOW_CACHE["uids_at"] < FOLLOW_UIDS_TTL:
         return FOLLOW_CACHE["uids"]
     uid = self_uid()
     if not uid:
@@ -5569,7 +5629,7 @@ def _following_people(force=False):
     if (not force and FOLLOW_PEOPLE_CACHE["list"]
             and now - FOLLOW_PEOPLE_CACHE["at"] < FOLLOW_PEOPLE_TTL):
         return list(FOLLOW_PEOPLE_CACHE["list"])
-    uids = _following_uids()
+    uids = _following_uids(force_uids)
     batches = [uids[i:i + FOLLOW_BATCH] for i in range(0, len(uids), FOLLOW_BATCH)]
 
     def one(batch):
@@ -6036,6 +6096,13 @@ def _vtbs_attach(items):
             continue
         x["follower"] = p.get("follower") or 0
         x["vtbs"] = True
+        # B 站批量查开播状态时，偶尔会给「在播但 uname/face 为空」的条目
+        # （房间刚开播 / 风控降级）。vtbs 的资料表正好补这两个字段，
+        # 否则列表里会出现没有名字、头像是个「?」的行。
+        if not x.get("uname") and p.get("uname"):
+            x["uname"] = p["uname"]
+        if not x.get("face") and p.get("face"):
+            x["face"] = p["face"]
         if p.get("sign"):
             x["sign"] = p["sign"]
         if p.get("guard"):
@@ -6136,7 +6203,7 @@ def api_danmist_start():
                  "download": DANMIST_DOWNLOAD, "running": False}
 
 
-def _follow_live_fetch():
+def _follow_live_fetch(force_uids=False):
     """同步跑完整条链：名单 → 并发查开播 → 按人气排序。
 
     ⚠️ 只要**有一批**取失败就必须整体抛错：那一批里的在播主播会整批消失，
@@ -6216,6 +6283,17 @@ def _follow_store(live):
        写着「未开播」）。完整性现在由 `_follow_live_fetch` 的「任一批失败即抛错」
        保证，这里只负责落盘。
     """
+    # 上游偶尔会给「在播、但 uname/face 为空」的条目：不能拿它覆盖上一份好数据，
+    # 否则刷新一次列表就变成一排没名字的行（实测 72 条里有 17 条）。
+    prev = {str(x.get("mid")): x for x in (FOLLOW_CACHE.get("list") or [])}
+    for x in live:
+        o = prev.get(str(x.get("mid")))
+        if not o:
+            continue
+        if not x.get("uname"):
+            x["uname"] = o.get("uname") or ""
+        if not x.get("face"):
+            x["face"] = o.get("face") or ""
     with FOLLOW_LOCK:
         FOLLOW_CACHE["at"] = time.time()
         FOLLOW_CACHE["list"] = live
@@ -6232,7 +6310,10 @@ def _kick_follow_refresh():
     def work():
         try:
             t0 = time.time()
-            _follow_store(_follow_live_fetch())
+            # uid 名单缓存 30 分钟；后台刷新时若名单已超过 5 分钟，顺带重读一次关注关系 ——
+            # 否则用户刚取消关注，后台每 2 分钟刷新的仍是旧名单，那个人会一直在列表里。
+            stale_uids = time.time() - float(FOLLOW_CACHE.get("uids_at") or 0) > 300
+            _follow_store(_follow_live_fetch(force_uids=stale_uids))
             print("[follow] 后台刷新完成：%d 位在播，%d ms"
                   % (len(FOLLOW_CACHE["list"]), int((time.time() - t0) * 1000)))
         except Exception as e:
@@ -6279,7 +6360,8 @@ def api_following_live(force=False):
                      "age": int(now - FOLLOW_CACHE["at"])}
     t0 = time.time()
     try:
-        live = _follow_live_fetch()
+        # 手动刷新（force）= 重新读关注关系，不再用半小时前的 uid 名单
+        live = _follow_live_fetch(force_uids=bool(force))
     except Exception as e:
         # 同步取失败：有旧数据就把它连同原因一起给前端（列表不清空、只标「刷新失败」），
         # 没有旧数据才真的报错。以前这里直接抛 500，页面只剩一句「读取失败」。
@@ -8129,6 +8211,12 @@ def ws_accept(handler):
         return False
     accept = base64.b64encode(
         hashlib.sha1((key + WS_GUID).encode("ascii")).digest()).decode("ascii")
+    # ⚠️ 握手必须回 HTTP/1.1：Handler 继承 BaseHTTPRequestHandler 的默认值 HTTP/1.0，
+    #    状态行就成了 "HTTP/1.0 101 Switching Protocols"。Chrome 容忍这种 1.0 的升级，
+    #    **Firefox 直接判握手失败**（控制台 "can't establish a connection to the server"），
+    #    表现就是监控室每一格都黑着、但同一个接口用 curl/Chrome 都正常。
+    #    只在这一条连接上改，不影响普通请求（它们仍走 1.0 + 关闭连接）。
+    handler.protocol_version = "HTTP/1.1"
     handler.send_response(101, "Switching Protocols")
     handler.send_header("Upgrade", "websocket")
     handler.send_header("Connection", "Upgrade")
@@ -11138,7 +11226,7 @@ class Handler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/danmist/status":
             return self._json(*api_danmist_status())
         if parsed.path == "/api/live/emoticons":
-            return self._json(*api_live_emoticons("refresh" in q))
+            return self._json(*api_live_emoticons("refresh" in q, q.get("room", [""])[0]))
         if parsed.path == "/api/feedback/conf":
             return self._json(*api_feedback_conf())
         if parsed.path == "/api/live/playinfo":

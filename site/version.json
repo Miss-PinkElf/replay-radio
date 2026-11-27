@@ -1,10 +1,10 @@
 {
-  "version": "1.9.35",
-  "name": "ReplayRadio-v1.9.35.exe",
-  "size": 56310729,
-  "sha256": "c25bf8a668c3aa32e0f2b7888dfee31566c5d450fde862b49f8f1b72be418ec6",
-  "url": "https://github.com/DcC176/replay-radio/releases/download/v1.9.35/ReplayRadio-v1.9.35.exe",
-  "published": "2026-11-27T08:04:15Z",
-  "notes": "弹幕板 SC / 礼物 / 来过 / 舰长 全部打通",
+  "version": "1.9.38",
+  "name": "ReplayRadio-v1.9.38.exe",
+  "size": 56314814,
+  "sha256": "ae860c1897db3b825522827c894848dd9c63fbd2d78f8b782f8faa7030b4cb7e",
+  "url": "https://github.com/DcC176/replay-radio/releases/download/v1.9.38/ReplayRadio-v1.9.38.exe",
+  "published": "2026-11-27T16:33:13Z",
+  "notes": "检查更新时，弹窗只显示「这次对你有什么影响」，技术细节不再混在里面；隔了好几版没升级，会按版本一条条列清楚",
   "_note": "软件内更新检查的兜底数据源。发版时随 site/index.html 的 VERSION 一起改，发布到 gh-pages 后生效。"
 }
